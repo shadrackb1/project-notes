@@ -139,8 +139,12 @@ if ((Test-Path $pyHome) -and (Test-Path (Split-Path $py3))) {
         $refresh = (Get-Item $pyHome).LastWriteTimeUtc -gt (Get-Item $py3).LastWriteTimeUtc
     }
     if ($refresh) {
-        Copy-Item -LiteralPath $pyHome -Destination $py3 -Force
-        Write-Log "refreshed python3.exe from $pyHome"
+        try {
+            Copy-Item -LiteralPath $pyHome -Destination $py3 -Force
+            Write-Log "refreshed python3.exe from $pyHome"
+        } catch {
+            Write-Log "could not refresh python3.exe: $($_.Exception.Message)"
+        }
     }
 }
 
