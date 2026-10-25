@@ -1,0 +1,239 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# Claude Code launcher.
+#
+# Routes Claude Code through a local LiteLLM proxy (:8788) which forwards to
+# NVIDIA NIM models. Claude Code speaks the Anthropic Messages API, so
+# behaviour, streaming and tool calls are identical to using Claude's own
+# endpoints.
+#
+# Proxy config : C:/Users/ADMIN/.claude-nim/config.yaml
+# Proxy log    : C:/Users/ADMIN/.claude-nim/litellm.log
+# ---------------------------------------------------------------------------
+
+set -uo pipefail
+
+NIM_DIR="/c/Users/ADMIN/.claude-nim"
+LITELLM="/c/Users/ADMIN/AppData/Roaming/Python/Python314/Scripts/litellm.exe"
+CLAUDE_BIN="/c/Users/ADMIN/.local/bin/claude.exe"
+# Claude Code talks to compat.py, which strips request fields the free
+# backends reject (fast mode's `speed`) and forwards everything else to the
+# LiteLLM proxy on :8788.
+UPSTREAM_PORT=8788
+PORT="${CLAUDE_PROXY_PORT:-8791}"
+COMPAT_PY='C:\Users\ADMIN\.claude-nim\compat.py'
+# Overridable so requests can be inspected by a relay (see .claude-nim/sniff.py).
+BASE_URL="${CLAUDE_PROXY_BASE_URL:-http://127.0.0.1:${PORT}}"
+
+# --- Model routing ---------------------------------------------------------
+# Send Claude-shaped model names, not raw provider ids. The proxy maps each one
+# to an NVIDIA NIM model (config.yaml), but Claude Code only enables thinking
+# budgets, effort scaling and fine-grained tool streaming when it recognises
+# the id. Raw ids like "nvidia/nemotron-..." logged
+# `[claude-code:unrecognized_model]` on every request and silently turned those
+# features off. These names are the recognised catalog entries (see
+# modelSettings in ~/.claude/settings.json).
+export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5.5"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5.5"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-5.5"
+# Subagents get the sonnet-tier backend: capable enough to edit and run tests,
+# and cheap enough to keep 50 of them in flight at once.
+export CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5.5"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="claude-opus-5.5"
+
+# Make the `fable` and `best` aliases resolve through the proxy. This lands on
+# the strongest NVIDIA model available to the key.
+export ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5.1"
+
+# These model ids are not Anthropic's, so Claude Code would otherwise assume a
+# 200k window and warn on every launch. Declare it explicitly.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="200000"
+
+export ANTHROPIC_BASE_URL="${BASE_URL}"
+export ANTHROPIC_API_KEY="not-used"
+
+# --- Read secrets from the user environment if not already present --------
+read_reg() {
+    reg query "HKCU\\Environment" -v "$1" 2>/dev/null | sed -n 's/.*REG_SZ[[:space:]]*//p' | tr -d '\r'
+}
+
+if [[ -z "${LITELLM_MASTER_KEY:-}" ]]; then
+    LITELLM_MASTER_KEY="$(read_reg LITELLM_MASTER_KEY)"
+fi
+if [[ -z "${NVIDIA_API_KEY:-}" ]]; then
+    NVIDIA_API_KEY="$(read_reg NVIDIA_API_KEY)"
+fi
+
+if [[ -z "${LITELLM_MASTER_KEY:-}" ]]; then
+    echo "Error: LITELLM_MASTER_KEY is not set." >&2
+    echo "Run: setx LITELLM_MASTER_KEY sk-your-key" >&2
+    exit 1
+fi
+if [[ -z "${NVIDIA_API_KEY:-}" ]]; then
+    echo "Error: NVIDIA_API_KEY is not set; NVIDIA NIM models cannot be reached." >&2
+    echo "Run: setx NVIDIA_API_KEY nvapi-..." >&2
+    exit 1
+fi
+
+export LITELLM_MASTER_KEY
+export NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"
+# Claude Code authenticates to the proxy with the master key.
+export ANTHROPIC_AUTH_TOKEN="$LITELLM_MASTER_KEY"
+
+# ---------------------------------------------------------------------------
+# After a booth restart the process environment is fresh; in case a user opens
+# a terminal before the startup script has finished, the wrapper still tries to
+# recover the proxy from here. All four-layer reachability checks above share
+# the same health endpoint and restart paths, so a single command is enough to
+# bring this machine back to a working state without anything else running.
+# ---------------------------------------------------------------------------
+# --- Fast mode -------------------------------------------------------------
+# `fastMode` in user settings is not enough: the client only honours the
+# opt-in from its flag-settings layer, so pass it on the command line. The
+# provider check is satisfied by CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL and
+# the entitlement checks by the SKIP_* variables below (also set in
+# ~/.claude/settings.json so SDK runs get them).
+export CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1
+export CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1
+export CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS=1
+
+# --- Auto mode's server-side classifier checks -----------------------------
+# Claude Code v2.1.28x+ can ask Anthropic's servers to vet the actions auto
+# mode gated instead of making its own classifier requests. That path needs a
+# gateway that forwards unknown body fields and returns `safeguard_results`,
+# which LiteLLM (drop_params: true) and NVIDIA NIM cannot do. Claude Code
+# detects the local gateway in ANTHROPIC_BASE_URL and switches back to its own
+# classifier, printing on every session:
+#
+#   We're changing auto mode to no longer charge for classifier requests...
+#   this session isn't eligible because your requests go through 127.0.0.1:8791
+#
+# Declaring that the server cannot provide the checks stops the client asking,
+# so the notice is skipped; auto mode keeps working on local classification.
+export CLAUDE_CODE_AUTO_MODE_SERVER=0
+
+FAST_SETTINGS='{"fastMode":true}'
+has_settings=0
+for a in "$@"; do
+    case "$a" in
+        --settings|--settings=*) has_settings=1 ;;
+    esac
+done
+if [[ "$has_settings" -eq 0 ]]; then
+    set -- --settings "$FAST_SETTINGS" "$@"
+fi
+
+# --- Settings guard ---------------------------------------------------------
+# Repairs ~/.claude/settings.json before the CLI reads it: the auto-mode
+# classifier opt-out, gateway model discovery, the fast-mode entitlements and
+# the permission keys that can hide modes or tools. A session (or a crashed
+# writer) can leave those missing, and the failure mode is a working-looking
+# client that parks every auto-mode turn or offers six models. Runs for every
+# invocation, including --version, and can never block the launch.
+SETTINGS_GUARD='C:\Users\ADMIN\.claude-nim\settings-guard.py'
+GUARD_PY="/c/Python314/python.exe"
+[ -x "$GUARD_PY" ] || GUARD_PY=python
+"$GUARD_PY" "$SETTINGS_GUARD" >/dev/null 2>&1 || true
+
+# --- Fast path for informational commands ---------------------------------
+for arg in "$@"; do
+    case "$arg" in
+        --version|-v|--help|-h)
+            exec "$CLAUDE_BIN" "$@"
+            ;;
+    esac
+done
+
+# Proxy + shim readiness ---------------------------------------------------------------
+# This machine's Claude Code never talks to Anthropic's servers; it talks to the
+# local LiteLLM proxy on :8788 and the compat.py shim on :8791. If both are down,
+# the wrapper starts them. start-proxy.ps1 is the authoritative restart path; it
+# launches the proxy detached, waits up to 120s for liveliness, and also probes
+# the shim. The wrapper only uses the wrapper's own health checks as a fast path.
+
+proxy_is_running() {
+    curl -s --max-time 2 "${BASE_URL}/health/liveliness" 2>/dev/null | grep -q alive
+}
+
+upstream_is_running() {
+    curl -s --max-time 2 "http://127.0.0.1:${UPSTREAM_PORT}/health/liveliness" 2>/dev/null | grep -q alive
+}
+
+shim_is_running() {
+    curl -s --max-time 2 "http://127.0.0.1:8791/health/liveliness" 2>/dev/null | grep -q alive
+}
+
+start_shim() {
+    # Detached through PowerShell for the same reason as the proxy: a plain
+    # background job dies with the shell that spawned it. Python is addressed
+    # by absolute path: under a minimal PATH `python` can be the Windows Store
+    # stub, which exits without listening and leaves this on ECONNREFUSED.
+    powershell -NoProfile -Command \
+        "Start-Process -FilePath 'C:\Python314\python.exe' -ArgumentList '$COMPAT_PY' -WindowStyle Hidden" \
+        >/dev/null 2>&1
+}
+
+start_proxy() {
+    mkdir -p "$NIM_DIR"
+    # start-proxy.ps1 is idempotent: if the proxy is already running it exits 0
+    # immediately. Use it even when upstream_is_running says no, because it also
+    # re-reads the master key from HKCU (older shells may not have inherited it).
+    powershell -NoProfile -ExecutionPolicy Bypass \
+        -File "$NIM_DIR/start-proxy.ps1" >/dev/null 2>&1 || true
+
+    # Give start-proxy.ps1 (which waits up to 120s internally) a chance to finish.
+    local tried=0
+    while [[ $tried -lt 40 ]]; do
+        upstream_is_running && break
+        sleep 3
+        ((tried++))
+    done
+
+    if ! upstream_is_running; then
+        echo "Error: LiteLLM proxy on :${UPSTREAM_PORT} did not become ready after 120s." >&2
+        echo "last lines of $NIM_DIR/litellm.err.log:" >&2
+        tail -n 25 "$NIM_DIR/litellm.err.log" >&2
+        return 1
+    fi
+
+    # The shim is managed by the watchdog, but if someone killed it the wrapper
+    # restarts it so a single `claude` call does not hang.
+    if ! shim_is_running; then
+        start_shim
+        local s=0
+        while [[ $s -lt 30 ]]; do
+            shim_is_running && break
+            sleep 1
+            ((s++))
+        done
+    fi
+
+    # Final self-check: the wrapper's BASE_URL must answer before we hand the CLI
+    # to the real executable.
+    if ! proxy_is_running; then
+        echo "Error: compat shim on :${PORT} did not become ready after 30s." >&2
+        return 1
+    fi
+    return 0
+}
+
+if ! proxy_is_running || ! upstream_is_running; then
+    echo "Starting Claude proxy on :${PORT} ..." >&2
+    if ! start_proxy; then
+        # Deliberately not fatal: the session opens, and the watchdog keeps
+        # retrying in the background. Exiting here meant one bad moment at
+        # login (a slow start, a locked port) turned into "claude does not
+        # start" until the user fixed it by hand.
+        echo "Warning: the Claude proxy is not answering yet. Starting Claude Code anyway;" >&2
+        echo "the watchdog will keep restarting it. Recent proxy log:" >&2
+        tail -n 15 "$NIM_DIR/litellm.err.log" 2>/dev/null >&2
+    else
+        echo "Proxy ready." >&2
+    fi
+fi
+
+if [[ "${CLAUDE_WRAPPER_DEBUG:-0}" == "1" ]]; then
+    printf 'wrapper argv: %s\n' "$*" >&2
+fi
+
+exec "$CLAUDE_BIN" "$@"

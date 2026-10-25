@@ -1,0 +1,9 @@
+# Secrets and per-machine state. The scripts are portable; these are not.
+.env
+*.log
+health.json
+maintenance.state
+probe_results.json
+__pycache__/
+config.good.yaml.prev
+config.yaml.*
