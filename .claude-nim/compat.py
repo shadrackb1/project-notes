@@ -85,6 +85,7 @@ AGENT_DIRECTIVE = (
 # arguments. Set NIM_FREQUENCY_PENALTY=0 to turn it off.
 REPETITION_PENALTY = float(os.environ.get("NIM_FREQUENCY_PENALTY", "0.6"))
 PRESENCE_PENALTY = float(os.environ.get("NIM_PRESENCE_PENALTY", "0.3"))
+_penalty_announced = False
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compat.log")
 # One generation of history is enough to diagnose a failed session, and an
@@ -307,6 +308,7 @@ def tame_repetition(payload: dict) -> bool:
     a deliberate 0) always wins. Both are standard OpenAI-compatible sampling
     fields and the backend accepted them for chat, tool and thinking requests.
     """
+    global _penalty_announced
     changed = False
     if not isinstance(payload.get("frequency_penalty"), (int, float)) and REPETITION_PENALTY > 0:
         payload["frequency_penalty"] = REPETITION_PENALTY
@@ -314,6 +316,10 @@ def tame_repetition(payload: dict) -> bool:
     if not isinstance(payload.get("presence_penalty"), (int, float)) and PRESENCE_PENALTY > 0:
         payload["presence_penalty"] = PRESENCE_PENALTY
         changed = True
+    if changed and not _penalty_announced:
+        _penalty_announced = True
+        log("repetition penalties applied: frequency=%s presence=%s"
+            % (REPETITION_PENALTY, PRESENCE_PENALTY))
     return changed
 
 
