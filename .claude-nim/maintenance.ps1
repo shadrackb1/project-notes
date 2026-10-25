@@ -63,6 +63,22 @@ function Show-Toast($message) {
     }
 }
 
+# Two supervisors exist on purpose (the keeper and the scheduled task), which
+# means both can fire in the same minute. Guards and doctor both rewrite files,
+# so overlapping runs could make one of them read a half-written config and
+# "repair" a file that was never broken. Only one run may be in flight.
+$mutex = New-Object System.Threading.Mutex($false, 'Local\ClaudeNimMaintenance')
+$owned = $false
+try {
+    $owned = $mutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+    $owned = $true
+}
+if (-not $owned) {
+    Write-Log 'another maintenance run is in progress; skipping this one'
+    exit 0
+}
+
 # A scheduled task that keeps firing while the proxy is mid-restart would
 # fight the watchdog. The watchdog owns the restart decision while it is alive;
 # this script only starts the things that are missing entirely.
