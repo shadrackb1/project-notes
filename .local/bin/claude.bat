@@ -37,6 +37,13 @@ REM Native-1M models: keep the whole window. 1M is the client maximum.
 set CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000
 set CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000
 
+REM Python scripts: UTF-8 stdio (cp1252 breaks on arrows/emoji), unbuffered
+REM output, and the native PowerShell tool for Windows quoting.
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+set PYTHONUNBUFFERED=1
+set CLAUDE_CODE_USE_POWERSHELL_TOOL=1
+
 REM Skip proxy bootstrap for informational commands
 set SKIP_PROXY=false
 for %%a in (%*) do (

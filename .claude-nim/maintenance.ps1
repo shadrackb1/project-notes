@@ -127,6 +127,23 @@ foreach ($guard in @('config-guard.py', 'settings-guard.py')) {
     if ($out.Trim()) { Write-Log ("{0}: {1}" -f $guard, ($out.Trim() -replace "`r?`n", ' | ')) }
 }
 
+# --- python3 alias ---------------------------------------------------------
+# Claude often runs `python3`, but python.org installs only `python.exe` and
+# Windows has no python3 alias. Keep a copy on the user PATH. A hardlink to
+# C:\Python314 is denied by Windows, so refresh the copy when Python changes.
+$pyHome = 'C:\Python314\python.exe'
+$py3 = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.local\bin\python3.exe'
+if ((Test-Path $pyHome) -and (Test-Path (Split-Path $py3))) {
+    $refresh = -not (Test-Path $py3)
+    if (-not $refresh) {
+        $refresh = (Get-Item $pyHome).LastWriteTimeUtc -gt (Get-Item $py3).LastWriteTimeUtc
+    }
+    if ($refresh) {
+        Copy-Item -LiteralPath $pyHome -Destination $py3 -Force
+        Write-Log "refreshed python3.exe from $pyHome"
+    }
+}
+
 $doctorOut = & $python (Join-Path $nimDir 'doctor.py') 2>&1 | Out-String
 $doctorExit = $LASTEXITCODE
 if ($doctorExit -ne 0) {

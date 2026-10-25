@@ -51,6 +51,15 @@ export ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5.1"
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS="1000000"
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW="1000000"
 
+# Windows Python defaults stdio to cp1252; scripts that print Unicode then die
+# with UnicodeEncodeError. UTF-8 mode and unbuffered output keep tool output
+# readable and streaming. The native PowerShell tool avoids Bash heredoc
+# quoting traps on Windows.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export PYTHONUNBUFFERED=1
+export CLAUDE_CODE_USE_POWERSHELL_TOOL=1
+
 export ANTHROPIC_BASE_URL="${BASE_URL}"
 export ANTHROPIC_API_KEY="not-used"
 

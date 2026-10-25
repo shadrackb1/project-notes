@@ -60,9 +60,9 @@ not the network. The window is the full 1M now: all five aliases resolve to
 native-1M NIM models, and a direct probe accepted a 300k-token prompt. 1M is
 the hard ceiling (the model's window and the largest value Claude Code
 accepts); there is no unlimited setting. Claude Code reserves 2%, so a fresh
-session reports `effectiveWindow=980000`. Auto-compact is left in whatever
-state the user chose, and when it is on it uses the same window. If a turn
-still fails, check the newest proxy log for `Timeout` or `RateLimitError`. A
+session reports `effectiveWindow=980000`. Auto-compact is off on this machine
+by the user's choice; if you turn it back on, it uses the same window. If a
+turn still fails, check the newest proxy log for `Timeout` or `RateLimitError`. A
 restart is safe; turns already running will fail, so do it between requests.
 
 **`429` or `Too Many Requests` under load.** Two NVIDIA keys are configured.
@@ -72,6 +72,23 @@ the other. The second key lives only in `.env` as `NVIDIA_API_KEY_2`; it is
 never written to `config.yaml` or committed. Add a third or fourth by
 appending `NVIDIA_API_KEY_3` (or `_4`) to `.env`, then run `build_config.py`
 and restart the proxy; the generator discovers the new key automatically.
+
+**Python scripts fail, or print `UnicodeEncodeError`.** python.org installs
+only `python.exe`, so Claude's `python3 script.py` used to exit 127 with
+`python3: command not found`. `~/.local/bin/python3.exe` is a copy of
+`C:\Python314\python.exe` on the user PATH; `maintenance.ps1` refreshes it
+when Python updates. `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8` and
+`PYTHONUNBUFFERED=1` are set in settings, the launcher and the guard, so
+arrows and emoji no longer die on cp1252 and progress output streams instead
+of waiting for the buffer to fill. Bash heredocs are still fragile on Windows:
+write files with the Write/Edit tool, not `cat <<EOF`.
+
+**`File has been modified since read` when writing.** This is Claude Code's
+safety check, not a broken Write tool: the file changed after the Read, often
+because `npm install`, a formatter, or a generator touched it. Read the file
+again and retry. There is no supported switch to turn the check off; if it
+stays stuck on an unchanged file, use the filesystem MCP writer or start a new
+session, and prefer `Edit` over `Write` for targeted changes.
 
 **The model repeats one sentence and never acts.** Decoder degeneration, not a
 prompt problem. A real session produced a 25,828-character message that was
@@ -115,8 +132,10 @@ as the end of the turn. `~/.claude/hooks/stop_guard.py` catches the
 plan-without-action shape and returns exit 2, which continues the turn with an
 instruction to act. It reads the *last sentences* of the message, because that
 is where "... Let me fix it and run again." appears; an earlier version only
-looked at the first word and missed it. Check the classifier without spending
-a model turn:
+looked at the first word and missed it. A final "I'll monitor them" or "I'll
+notify you when it completes" is allowed when the same turn launched an agent,
+workflow, or background shell job; with no such launch it is still a plan-only
+stop and is blocked. Check the classifier without spending a model turn:
 
 ```powershell
 python ~/.claude/hooks/stop_guard.py --selftest

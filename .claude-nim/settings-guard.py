@@ -92,6 +92,15 @@ REQUIRED_ENV = {
     # usable window, so a session is not artificially limited either way.
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+    # Windows Python defaults stdio to cp1252. Scripts that print arrows,
+    # checkmarks or non-Latin text then die with UnicodeEncodeError. UTF-8 mode
+    # and unbuffered output make script runs readable and stream as they work.
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8",
+    "PYTHONUNBUFFERED": "1",
+    # Native PowerShell tool on Windows: Bash heredocs break on content with
+    # backticks and `$`, and here-strings are the safer shape for a long file.
+    "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1",
     # A stalled subagent used to be waited on for 30 minutes, and the main
     # agent sat at "Waiting for N dynamic workflows to finish" for over an
     # hour while nothing progressed. Four minutes is far beyond the ~90s first
@@ -113,7 +122,15 @@ REQUIRED_ENV = {
 
 # Tools a deny rule must never take away on a machine where the user asked for
 # every mode to be unlocked.
-UNDENIED_TOOLS = ("WebSearch", "WebFetch", "Bash", "Read", "Edit", "Write")
+UNDENIED_TOOLS = (
+    "WebSearch",
+    "WebFetch",
+    "Bash",
+    "PowerShell",
+    "Read",
+    "Edit",
+    "Write",
+)
 
 # Auto mode must never come back. The classifier it depends on cannot work
 # behind LiteLLM + NVIDIA NIM, and when it fails it blocks Bash/PowerShell
@@ -126,6 +143,7 @@ DISABLE_AUTO_MODE = "disable"
 # which makes Claude Code continue the turn with the instruction to act.
 HOOK_PYTHON = r"C:\Python314\python.exe"
 STOP_HOOK = os.path.join(CLAUDE_DIR, "hooks", "stop_guard.py")
+VALIDATE_HOOK = os.path.join(CLAUDE_DIR, "hooks", "validate.py")
 
 
 def ensure_stop_hook(data: dict) -> bool:
@@ -156,6 +174,80 @@ def ensure_stop_hook(data: dict) -> bool:
             entries.append({"hooks": [{"type": "command", "command": command, "timeout": 20}]})
             changed = True
     return changed
+
+
+def ensure_validate_hook(data: dict) -> bool:
+    """Register validate.py with the absolute interpreter path.
+
+    The old entry used bare ``python``. Hooks inherit a minimal PATH when
+    Claude Code is started from an IDE or a shortcut, so the check sometimes
+    disappeared with "python is not recognized" instead of checking the write.
+    """
+    if not os.path.exists(VALIDATE_HOOK):
+        return False
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        data["hooks"] = hooks
+    entries = hooks.get("PostToolUse")
+    if not isinstance(entries, list):
+        entries = []
+        hooks["PostToolUse"] = entries
+
+    command = '"%s" "%s"' % (HOOK_PYTHON, VALIDATE_HOOK)
+    found = False
+    changed = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        matcher = str(entry.get("matcher") or "")
+        if "Edit" not in matcher and "Write" not in matcher:
+            continue
+        inner = entry.get("hooks")
+        if not isinstance(inner, list):
+            continue
+        keep = []
+        for hook in inner:
+            refers = isinstance(hook, dict) and "validate.py" in str(
+                hook.get("command", "")
+            ).replace("\\", "/").lower()
+            if not refers:
+                keep.append(hook)
+                continue
+            if found:
+                changed = True  # drop a duplicate registration
+                continue
+            found = True
+            if hook.get("command") != command:
+                hook["command"] = command
+                changed = True
+            keep.append(hook)
+        if len(keep) != len(inner):
+            entry["hooks"] = keep
+            changed = True
+
+    if found:
+        kept_entries = [
+            entry
+            for entry in entries
+            if not (
+                isinstance(entry, dict)
+                and isinstance(entry.get("hooks"), list)
+                and not entry["hooks"]
+            )
+        ]
+        if len(kept_entries) != len(entries):
+            entries[:] = kept_entries
+            changed = True
+        return changed
+
+    entries.append(
+        {
+            "matcher": "Edit|Write|MultiEdit",
+            "hooks": [{"type": "command", "command": command}],
+        }
+    )
+    return True
 
 
 def log(message: str) -> None:
@@ -286,6 +378,8 @@ def repair(data: dict) -> list[str]:
 
     if ensure_stop_hook(data):
         changes.append("registered the Stop/SubagentStop guard hook")
+    if ensure_validate_hook(data):
+        changes.append("registered the PostToolUse validator with the absolute Python path")
 
     return changes
 

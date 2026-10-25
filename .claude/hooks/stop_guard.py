@@ -54,6 +54,22 @@ PLAN_PHRASE = re.compile(
 # Closing courtesies open like a plan but end a turn legitimately.
 COURTESY = ("let me know", "i'll keep you posted", "let me summarize")
 
+# A promise to watch work that is already running. These start like a plan but
+# are the correct close after a background agent, workflow, or shell job was
+# launched. Blocking them makes Claude Code re-answer a turn that is already
+# progressing, which is how "I'll notify you when it completes" turned into a
+# stop-hook error in a healthy session.
+CLOSING_PROMISE = re.compile(
+    r"^(?:i'll|i will|i'm going to|i am going to|let me)\s+"
+    r"(?:monitor|watch|wait for|notify|report|check back|follow up|"
+    r"let you know|keep you posted)\b",
+    re.IGNORECASE,
+)
+
+# Tools that hand work to something running after this turn ends. A closing
+# promise is only legitimate when one of these was called in the same turn.
+BACKGROUND_TOOLS = {"Task", "Agent", "Workflow"}
+
 # How much of the end counts as "the last thing it said".
 TAIL_CHARS = 600
 
@@ -109,12 +125,17 @@ def degenerate_repeat(text: str) -> tuple[str, int] | None:
     return None
 
 
-def plan_sentence(text: str) -> str | None:
+def plan_sentence(text: str, allow_closing: bool = False) -> str | None:
     """Return the sentence that announces an action, if the message is a plan.
 
     Deliberately conservative in three ways: a reply that ends in a question is
     a real request for the user, "let me know" is a real close, and a long
     message is treated as an answer.
+
+    ``allow_closing`` is set only when the current turn already started a
+    background agent/workflow/job. In that case a final "I'll monitor them" or
+    "I'll notify you when it completes" is a close on running work, not a plan
+    with nothing behind it.
     """
     lowered = text.lower()
     if any(courtesy in lowered for courtesy in COURTESY):
@@ -126,6 +147,13 @@ def plan_sentence(text: str) -> str | None:
 
     tail = text[-TAIL_CHARS:]
     sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", tail) if part.strip()]
+    if allow_closing and sentences and CLOSING_PROMISE.match(sentences[-1]):
+        # Only the final promise is excused. "Let me fix it. I'll notify you."
+        # is still a plan to fix something, so a plan sentence immediately
+        # before the promise keeps the block.
+        prior = sentences[-2] if len(sentences) > 1 else ""
+        if not prior or not PLAN_PHRASE.match(prior):
+            return None
     for sentence in sentences[-2:]:
         if PLAN_PHRASE.match(sentence):
             return sentence
@@ -159,6 +187,15 @@ SELFTEST = (
     ("allow", "Tests: 3 passed. Tests: 3 passed. Lint clean. Build clean."),
 )
 
+# Closing promises that are legitimate only after background work was started.
+# With the gate off they must still block, or the guard would allow a model to
+# promise monitoring without launching anything.
+CLOSING_SELFTEST = (
+    "The verification workflow has been launched. I'll notify you when it completes.",
+    "Three agents are running. I'll monitor them and report results when complete.",
+    "The job is running in the background. I'll report back when it finishes.",
+)
+
 
 def log(message: str) -> None:
     try:
@@ -168,6 +205,60 @@ def log(message: str) -> None:
         pass
 
 
+def is_tool_result_entry(entry: dict) -> bool:
+    """True for the user-role entries that carry a tool result, not a prompt."""
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    blocks = [block for block in content if isinstance(block, dict)]
+    return bool(blocks) and all(block.get("type") == "tool_result" for block in blocks)
+
+
+def turn_started_background(path: str) -> bool:
+    """True when this turn launched an agent, workflow, or background shell job.
+
+    Only used to excuse a closing promise. A message that says "I'll monitor
+    them" after a workflow was launched is a close; the same message with no
+    launched work is exactly the plan-only stop this hook exists to catch.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return False
+    for line in reversed(lines[-800:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("type")
+        if kind == "user" and not is_tool_result_entry(entry):
+            return False  # reached the prompt that started this turn
+        if kind != "assistant":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        for block in content_blocks(message):
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name") or "")
+            payload = block.get("input")
+            if name in BACKGROUND_TOOLS:
+                return True
+            if name == "Bash" and isinstance(payload, dict) and payload.get("run_in_background"):
+                return True
+    return False
+
+
 def last_assistant_message(path: str) -> dict | None:
     """Return the newest assistant entry in the transcript JSONL."""
     try:
@@ -175,7 +266,7 @@ def last_assistant_message(path: str) -> dict | None:
             lines = handle.readlines()
     except OSError:
         return None
-    for line in reversed(lines[-400:]):
+    for line in reversed(lines[-800:]):
         line = line.strip()
         if not line:
             continue
@@ -212,7 +303,16 @@ def main() -> int:
             if verdict != expected:
                 failures += 1
                 print("FAIL expected %s got %s: %r" % (expected, verdict, sample))
-        print("selftest: %d/%d" % (len(SELFTEST) - failures, len(SELFTEST)))
+        checked = len(SELFTEST)
+        for sample in CLOSING_SELFTEST:
+            checked += 2
+            if not plan_sentence(sample):
+                failures += 1
+                print("FAIL closing promise must block without background work: %r" % sample)
+            if plan_sentence(sample, allow_closing=True):
+                failures += 1
+                print("FAIL closing promise must be allowed after background work: %r" % sample)
+        print("selftest: %d/%d" % (checked - failures, checked))
         return 1 if failures else 0
 
     raw = sys.stdin.read()
@@ -255,7 +355,9 @@ def main() -> int:
         print(LOOP_REASON, file=sys.stderr)
         return 2
 
-    sentence = plan_sentence(text)
+    sentence = plan_sentence(
+        text, allow_closing=turn_started_background(transcript) if transcript else False
+    )
     if not sentence:
         return 0
 
