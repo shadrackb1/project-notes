@@ -185,17 +185,35 @@ def main() -> int:
     add("stop hook", hook_ok, "registered" if hook_ok else "NOT registered")
     add("auto mode", data.get("disableAutoMode") == "disable",
         str(data.get("disableAutoMode")))
-    # Not a fixed number: what matters is enough headroom that a turn is still
-    # generated below the range where these backends start to loop. 30k is the
-    # floor; the configured pair is 110k of 160k.
+    # The aliases are native-1M models and that is also the highest window
+    # Claude Code accepts. A smaller cap silently throws context away; a value
+    # below 100k or above the model's window is rejected by the client.
     window = env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     context = env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
     try:
-        headroom = int(context) - int(window)
+        window_i, context_i = int(window), int(context)
     except (TypeError, ValueError):
-        headroom = 0
-    add("compaction", headroom >= 30000,
-        "%s of %s (%+d headroom)" % (window, context, headroom))
+        window_i = context_i = 0
+    add("context window", context_i >= 1_000_000
+        and 100_000 <= window_i <= 1_000_000 and window_i <= context_i,
+        "%s of %s (auto-compact %s)" % (
+            window, context,
+            "on" if data.get("autoCompactEnabled") is not False else "off"))
+
+    # Two keys are the difference between one 429 ending a turn and the router
+    # retrying on the other key. Values are never printed.
+    keys = [name for name in ("NVIDIA_API_KEY", "NVIDIA_API_KEY_2") if ENV.get(name)]
+    add("api keys", len(keys) >= 2, "%d configured" % len(keys))
+
+    # A key in .env only helps if the generated config actually uses it. The
+    # config holds variable names, never values.
+    try:
+        config_text = open(CONFIG, encoding="utf-8").read()
+    except OSError:
+        config_text = ""
+    balanced = bool(ENV.get("NVIDIA_API_KEY_2")) and "NVIDIA_API_KEY_2" in config_text
+    add("load balance", balanced,
+        "both keys routed" if balanced else "second key is not in config.yaml")
 
     current = {
         "litellm": version("litellm"),

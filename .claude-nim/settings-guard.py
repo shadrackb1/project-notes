@@ -77,19 +77,21 @@ REQUIRED_ENV = {
     # Non-Anthropic model ids: accept them instead of remapping/validating away.
     "CLAUDE_CODE_ALLOW_OTHER_MODELS": "1",
     "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
-    # Long sessions: past roughly 150k tokens the free reasoning models behind
-    # the proxy start emitting template tokens in a loop, LiteLLM turns that
-    # into a mid-stream InternalServerError, and the turn ends with "API
-    # error". Compacting before that point keeps every request inside the
-    # range these backends answer cleanly, and the two numbers must agree so
-    # Claude Code does not think it has more room than the compact window.
+    # The models behind this proxy are native-1M models (Claude Code reports
+    # contextWindow=1000000 for all five aliases), and the hosted NIM endpoint
+    # accepted a 300k-token prompt in a direct probe. Use the full window: the
+    # old 160k/110k pair was a workaround for decoder degeneration, but the
+    # repetition penalties in compat.py now address that at the sampler, so a
+    # smaller window only threw context away. 1M is also the highest value
+    # Claude Code accepts; there is no unlimited setting.
     #
-    # 110k, not 150k: a real session was at 3% from auto-compact (requests of
-    # 240-416 KB) and produced a 25,828-character message that was one sentence
-    # repeated 123 times. Degeneration starts well before the hard limit, so
-    # the window leaves ~50k of headroom for the turn being generated.
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "160000",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "110000",
+    # Auto-compact is the user's choice and is not forced here. When it is on,
+    # 1M is the documented default for native-1M models; Claude Code caps it at
+    # the model window and reserves 2%, which is why a fresh session reports
+    # effectiveWindow=980000. When it is off, the same numbers describe the
+    # usable window, so a session is not artificially limited either way.
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
     # A stalled subagent used to be waited on for 30 minutes, and the main
     # agent sat at "Waiting for N dynamic workflows to finish" for over an
     # hour while nothing progressed. Four minutes is far beyond the ~90s first
@@ -256,6 +258,17 @@ def repair(data: dict) -> list[str]:
         if tool not in allow:
             allow.append(tool)
             changes.append(f"allow {tool}")
+
+    # The top-level window applies to every model that has no per-model
+    # override. Set it here as well as in env: env is what Claude Code reads,
+    # but a settings reset otherwise leaves /autocompact at the old small
+    # value. 1M is the maximum the client accepts.
+    if data.get("autoCompactWindow") != 1000000:
+        data["autoCompactWindow"] = 1000000
+        changes.append("autoCompactWindow=1000000")
+
+    # Autocompact being off is the user's choice, so it is not forced here.
+    # When it is on, the 1M window above is the ceiling.
 
     if data.get("fastMode") is not True:
         data["fastMode"] = True

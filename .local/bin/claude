@@ -45,9 +45,11 @@ export ANTHROPIC_CUSTOM_MODEL_OPTION="claude-opus-5.5"
 # the strongest NVIDIA model available to the key.
 export ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5.1"
 
-# These model ids are not Anthropic's, so Claude Code would otherwise assume a
-# 200k window and warn on every launch. Declare it explicitly.
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="200000"
+# These model ids are alias names for the native-1M NIM models. Declare the
+# full window explicitly; 1M is both the model ceiling and the highest value
+# Claude Code accepts (there is no unlimited setting).
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="1000000"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="1000000"
 
 export ANTHROPIC_BASE_URL="${BASE_URL}"
 export ANTHROPIC_API_KEY="not-used"

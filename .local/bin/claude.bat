@@ -33,6 +33,10 @@ set ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5.1
 set CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-5.5
 set ANTHROPIC_CUSTOM_MODEL_OPTION=claude-opus-5.5
 
+REM Native-1M models: keep the whole window. 1M is the client maximum.
+set CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000
+set CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000
+
 REM Skip proxy bootstrap for informational commands
 set SKIP_PROXY=false
 for %%a in (%*) do (
