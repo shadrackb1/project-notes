@@ -136,6 +136,28 @@ function Stop-StaleProxy {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
+# --- One starter at a time -------------------------------------------------
+# Login can launch this script three ways at once (Startup folder, HKCU Run
+# entry, scheduled task). Without this, each copy sees an unhealthy proxy
+# during the other's warmup, kills it in Stop-StaleProxy, and starts again:
+# a kill/restart loop for as long as the launchers overlap. The loser now
+# waits for the winner instead of competing.
+$startMutex = New-Object System.Threading.Mutex($false, 'Local\ClaudeNimProxyStart')
+$startOwned = $false
+try {
+    $startOwned = $startMutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+    $startOwned = $true
+}
+if (-not $startOwned) {
+    for ($i = 0; $i -lt 120; $i++) {
+        Start-Sleep -Seconds 1
+        if (Test-Proxy) { exit 0 }
+    }
+    Write-Error 'another launcher is starting the proxy, but it is not ready after 120s'
+    exit 1
+}
+
 Stop-StaleProxy
 
 # --- Ensure the Python 'mcp' package is at least 2.2 (litellm >=1.106 needs it) ---

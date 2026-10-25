@@ -65,8 +65,18 @@ running will fail, so do it between requests.
 **The model describes a plan and stops.** Claude Code treats a text-only reply
 as the end of the turn. `~/.claude/hooks/stop_guard.py` catches the
 plan-without-action shape and returns exit 2, which continues the turn with an
-instruction to act. If it seems inactive, `python doctor.py` reports whether
-the hook is registered; settings resets are repaired by `settings-guard.py`.
+instruction to act. It reads the *last sentences* of the message, because that
+is where "... Let me fix it and run again." appears; an earlier version only
+looked at the first word and missed it. Check the classifier without spending
+a model turn:
+
+```powershell
+python ~/.claude/hooks/stop_guard.py --selftest
+```
+
+If a block seems missing, `stop_guard.log` records each one with the sentence
+that triggered it. `python doctor.py` reports whether the hook is registered;
+settings resets are repaired by `settings-guard.py`.
 
 **`/model` shows only a few entries.** `settings.json` lost
 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` or the classifier opt-out. Both
