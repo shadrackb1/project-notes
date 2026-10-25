@@ -56,11 +56,47 @@ shim is not, `maintenance.ps1` restarts it on its next pass; run it directly if
 you do not want to wait ten minutes.
 
 **`API error` after a long session.** Usually a stalled stream, not the network.
-The shim caps repeated streaming chunks (`REPEATED_STREAMING_CHUNK_LIMIT`) and
-the wrapper caps output tokens (`CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000`), so a
-looping answer ends instead of hanging. If it still happens, check the newest
-proxy log for `Timeout` or `RateLimitError`. A restart is safe; turns already
-running will fail, so do it between requests.
+Claude Code compacts at 110k of the 160k window now (see below), which keeps
+every request inside the range these backends answer cleanly. If it still
+happens, check the newest proxy log for `Timeout` or `RateLimitError`. A
+restart is safe; turns already running will fail, so do it between requests.
+
+**The model repeats one sentence and never acts.** Decoder degeneration, not a
+prompt problem. A real session produced a 25,828-character message that was
+`I need to actually emit tool calls.` repeated 123 times, with no tool call in
+it; the turn ended and the user watched a loop. It feeds itself: the loop goes
+back into the model's context, so the next turn is worse, and it gets likelier
+as the context fills.
+
+The shim adds the repetition penalties Claude Code never sends, in
+`tame_repetition()` (`compat.py`):
+
+```
+frequency_penalty 0.6   presence_penalty 0.3
+```
+
+Measured on this machine with the same loop replayed 40x as the prompt:
+
+| | repeats of one sentence | output | latency |
+| --- | --- | --- | --- |
+| no penalty | 512 (budget exhausted) | 18,431 chars | 40.7s |
+| penalty | 9-11 | 1-4 KB | 2s |
+
+Tool calling is unaffected: `tool_use` still comes back with parsed arguments.
+Tune it with `NIM_FREQUENCY_PENALTY` / `NIM_PRESENCE_PENALTY`; `0` disables it,
+and a value the client sets explicitly is never overwritten. `stop_guard.py`
+also catches the shape after the fact: six or more copies of one sentence in a
+single message returns exit 2 with an instruction to emit one call and no
+prose.
+
+**"Waiting for N dynamic workflows to finish" for an hour.** Two causes, both
+capped in `settings-guard.py` now: a stalled subagent was waited on for 30
+minutes (`CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=240000`), and up to 50 agents were
+in flight at once on backends that take 60-90s per request
+(`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=6`,
+`CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS=6`,
+`CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=80`). A dead agent is now abandoned in
+four minutes and the queue stays short enough to finish.
 
 **The model describes a plan and stops.** Claude Code treats a text-only reply
 as the end of the turn. `~/.claude/hooks/stop_guard.py` catches the
@@ -75,7 +111,7 @@ python ~/.claude/hooks/stop_guard.py --selftest
 ```
 
 If a block seems missing, `stop_guard.log` records each one with the sentence
-that triggered it. `python doctor.py` reports whether the hook is registered;
+that triggered it (`blocked a plan-only stop` or `blocked a degenerate stop`). `python doctor.py` reports whether the hook is registered;
 settings resets are repaired by `settings-guard.py`.
 
 **`/model` shows only a few entries.** `settings.json` lost

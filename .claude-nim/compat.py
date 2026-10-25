@@ -70,6 +70,22 @@ AGENT_DIRECTIVE = (
     "the turn and the work is never done."
 )
 
+# --- Repetition control -----------------------------------------------------
+# Observed failure: one assistant message of 25,828 characters that was the
+# sentence "I need to actually emit tool calls." repeated 123 times. No file was
+# read, written or run, and the turn ended in a loop the user had to watch.
+# That is decoder degeneration, and it feeds itself: the loop is replayed back
+# to the model from its own history, which makes the next turn worse.
+#
+# Claude Code never sends a repetition penalty, so the shim adds one. Measured
+# on this machine with the same loop replayed 40x as the prompt:
+#   plain    -> 512 repeats (token budget exhausted), 18,431 chars, 40.7s
+#   penalty  -> 9-10 repeats, 1-4 KB, 3.5-12.8s
+# Tool calling is unaffected: `tool_use` still comes back with parsed
+# arguments. Set NIM_FREQUENCY_PENALTY=0 to turn it off.
+REPETITION_PENALTY = float(os.environ.get("NIM_FREQUENCY_PENALTY", "0.6"))
+PRESENCE_PENALTY = float(os.environ.get("NIM_PRESENCE_PENALTY", "0.3"))
+
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compat.log")
 # One generation of history is enough to diagnose a failed session, and an
 # unbounded log eventually costs seconds per request on Windows.
@@ -284,6 +300,23 @@ def add_agent_directive(payload: dict) -> bool:
     return False
 
 
+def tame_repetition(payload: dict) -> bool:
+    """Add the repetition penalties Claude Code never sends. True if added.
+
+    Only fills in a value the caller left out, so an explicit choice (including
+    a deliberate 0) always wins. Both are standard OpenAI-compatible sampling
+    fields and the backend accepted them for chat, tool and thinking requests.
+    """
+    changed = False
+    if not isinstance(payload.get("frequency_penalty"), (int, float)) and REPETITION_PENALTY > 0:
+        payload["frequency_penalty"] = REPETITION_PENALTY
+        changed = True
+    if not isinstance(payload.get("presence_penalty"), (int, float)) and PRESENCE_PENALTY > 0:
+        payload["presence_penalty"] = PRESENCE_PENALTY
+        changed = True
+    return changed
+
+
 def drop_server_tools(payload: dict) -> bool:
     """Remove Anthropic server-side tool entries the backend cannot execute."""
     tools = payload.get("tools")
@@ -425,6 +458,8 @@ def scrub(body: bytes, content_type: str) -> bytes:
     if drop_server_tools(payload):
         changed = True
     if add_agent_directive(payload):
+        changed = True
+    if tame_repetition(payload):
         changed = True
     if not changed:
         return body

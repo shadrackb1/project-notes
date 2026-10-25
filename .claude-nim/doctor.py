@@ -185,8 +185,17 @@ def main() -> int:
     add("stop hook", hook_ok, "registered" if hook_ok else "NOT registered")
     add("auto mode", data.get("disableAutoMode") == "disable",
         str(data.get("disableAutoMode")))
-    add("compaction", env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == "150000",
-        str(env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")))
+    # Not a fixed number: what matters is enough headroom that a turn is still
+    # generated below the range where these backends start to loop. 30k is the
+    # floor; the configured pair is 110k of 160k.
+    window = env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+    context = env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+    try:
+        headroom = int(context) - int(window)
+    except (TypeError, ValueError):
+        headroom = 0
+    add("compaction", headroom >= 30000,
+        "%s of %s (%+d headroom)" % (window, context, headroom))
 
     current = {
         "litellm": version("litellm"),

@@ -83,8 +83,26 @@ REQUIRED_ENV = {
     # error". Compacting before that point keeps every request inside the
     # range these backends answer cleanly, and the two numbers must agree so
     # Claude Code does not think it has more room than the compact window.
+    #
+    # 110k, not 150k: a real session was at 3% from auto-compact (requests of
+    # 240-416 KB) and produced a 25,828-character message that was one sentence
+    # repeated 123 times. Degeneration starts well before the hard limit, so
+    # the window leaves ~50k of headroom for the turn being generated.
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "160000",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "150000",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "110000",
+    # A stalled subagent used to be waited on for 30 minutes, and the main
+    # agent sat at "Waiting for N dynamic workflows to finish" for over an
+    # hour while nothing progressed. Four minutes is far beyond the ~90s first
+    # byte these backends take, so a real answer still arrives and a dead agent
+    # is abandoned instead of blocking the session.
+    "CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS": "240000",
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "240000",
+    # 50 concurrent agents, each request taking 60-90s on a free tier, is how a
+    # workflow barrier turns into an hour of apparent hang. Six keeps the
+    # parallelism useful and the queue short.
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "6",
+    "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": "6",
+    "CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION": "80",
     # 64k output on a free backend means one rambling answer can stream for
     # 12+ minutes before it stops. 32k is the Claude Code default and still
     # fits a large file write, while halving the worst-case stall.

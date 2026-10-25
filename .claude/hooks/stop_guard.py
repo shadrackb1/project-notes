@@ -66,6 +66,48 @@ REASON = (
     "plan, do not ask for confirmation, and do not reply with another summary."
 )
 
+# A different failure with the same visible result. One real message was 25,828
+# characters of "I need to actually emit tool calls." repeated 123 times, with
+# no tool call anywhere in it. The client treats that as a finished turn, so the
+# user watches a loop that never acts.
+#
+# The instruction has to differ from REASON: repeating the same text back at a
+# model that is already looping just selects the loop again. This one names the
+# failure, forbids restating it, and asks for a single call.
+LOOP_REPEATS = 6
+LOOP_SENTENCE_MIN = 25
+
+LOOP_REASON = (
+    "Your last message repeated the same sentence over and over and contained "
+    "no tool call. That is a decoding failure, not an answer, and the work is "
+    "still undone. Do not explain, apologise or restate anything. Reply with "
+    "exactly one tool call - no prose before it."
+)
+
+
+def degenerate_repeat(text: str) -> tuple[str, int] | None:
+    """Return (sentence, count) when one message loops on itself.
+
+    Checked before the length exemption in `plan_sentence`, because a looping
+    message is long by construction and would otherwise be treated as a report.
+    A real answer can repeat a short phrase; six copies of a full sentence
+    cannot be anything but degeneration.
+    """
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?])\s+", text)
+        if len(part.strip()) >= LOOP_SENTENCE_MIN
+    ]
+    if len(sentences) < LOOP_REPEATS:
+        return None
+    counts: dict[str, int] = {}
+    for sentence in sentences:
+        counts[sentence] = counts.get(sentence, 0) + 1
+    sentence, count = max(counts.items(), key=lambda item: item[1])
+    if count >= LOOP_REPEATS:
+        return sentence, count
+    return None
+
 
 def plan_sentence(text: str) -> str | None:
     """Return the sentence that announces an action, if the message is a plan.
@@ -110,6 +152,11 @@ SELFTEST = (
     ("allow", "I've updated the schema and verified the endpoint returns 200."),
     ("allow", "The guard blocks a plan-only stop. Should I also cover subagents?"),
     ("allow", "Results: 14 passed, 0 failed, coverage unchanged."),
+    # The observed loop: 123 copies of one sentence, no tool call.
+    ("block", "I need to actually emit tool calls. " * 40),
+    ("block", "Let me make the calls now. " * 8 + "That is the plan."),
+    # Repetition that is not degeneration: a short list, or a sentence twice.
+    ("allow", "Tests: 3 passed. Tests: 3 passed. Lint clean. Build clean."),
 )
 
 
@@ -199,6 +246,13 @@ def main() -> int:
     if os.environ.get("STOP_GUARD_FORCE") == "1":
         log("forced block for wiring test")
         print(REASON, file=sys.stderr)
+        return 2
+
+    loop = degenerate_repeat(text)
+    if loop:
+        sentence, count = loop
+        log("blocked a degenerate stop: one sentence x%d (%d chars): %r" % (count, len(text), sentence[:100]))
+        print(LOOP_REASON, file=sys.stderr)
         return 2
 
     sentence = plan_sentence(text)
