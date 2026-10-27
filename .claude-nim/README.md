@@ -65,10 +65,22 @@ profile differently from Claude Code:
 That profile is now re-applied automatically. `maintenance.ps1` runs
 `desktop-3p.py ensure --quiet` on every pass (ten minutes, and at login
 through the keeper), so an app upgrade or a profile reset cannot leave the
-Desktop on the claude.ai sign-in screen:
+Desktop on the claude.ai sign-in screen. The same pass restores the rest of
+the Desktop setup:
+
+* the MCP servers from `~/.claude.json` are added to the Desktop profile
+  (existing entries win; the file is backed up before a change), so Desktop
+  has the same `filesystem`, `memory`, `playwright`, `search` and other tools
+  as the CLI instead of an empty tool list;
+* any top-level skill that exists in `~/.agents/skills` but is missing from
+  `~/.claude/skills` is copied in, which is what keeps the imported skills
+  from disappearing when a profile is reset or a new one is created.
+
+Like the gateway profile, these are only read at launch: after a repair,
+quit the app fully and reopen it.
 
 ```powershell
-python desktop-3p.py status    # provider, URL, key presence; exit 1 if not applied
+python desktop-3p.py status    # provider, URL, key, MCP count, skill count; exit 1 if not applied
 python desktop-3p.py ensure    # write/repair the profile now
 python desktop-3p.py remove    # delete only the localhost gateway profile
 ```

@@ -14,6 +14,10 @@ This script makes that state re-appliable:
     python desktop-3p.py status    # human-readable check, exit 1 when not applied
     python desktop-3p.py remove    # delete only the localhost gateway profile
 
+The same pass also restores the two things a reset silently drops: the MCP
+servers Desktop should share with Claude Code, and any top-level skill that
+exists in ~/.agents/skills but is missing from ~/.claude/skills.
+
 maintenance.ps1 runs `ensure` every ten minutes, so the profile comes back on
 its own. Values come from the same place the rest of the stack uses:
 LITELLM_MASTER_KEY (process env, then HKCU\\Environment) and CLAUDE_PROXY_PORT
@@ -29,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import uuid
 from pathlib import Path
@@ -124,6 +129,73 @@ def meta_entries(meta: dict) -> list:
     return entries
 
 
+def desktop_config_path() -> Path:
+    return Path.home() / "AppData" / "Local" / "Claude-3p" / "claude_desktop_config.json"
+
+
+def ensure_mcp_servers() -> str:
+    """Copy Claude Code's user-scope MCP servers into the Desktop profile.
+
+    The Desktop app reads MCP servers from its own config, not from
+    ~/.claude.json, so a reset or a fresh profile leaves it without the tools
+    the CLI already has. Existing entries win: this only adds what is missing.
+    """
+    cfg_path = desktop_config_path()
+    if not cfg_path.exists():
+        return ""
+    cfg = read_json(cfg_path, None)
+    if not isinstance(cfg, dict):
+        return ""
+
+    source = read_json(Path.home() / ".claude.json", {})
+    global_mcp = source.get("mcpServers") if isinstance(source, dict) else None
+    if not isinstance(global_mcp, dict) or not global_mcp:
+        return ""
+
+    current = cfg.get("mcpServers")
+    merged = dict(current) if isinstance(current, dict) else {}
+    added = [name for name in global_mcp if name not in merged]
+    if not added:
+        return ""
+
+    for name in added:
+        merged[name] = global_mcp[name]
+    cfg["mcpServers"] = merged
+
+    backup = cfg_path.with_name(cfg_path.name + ".bak")
+    try:
+        shutil.copy2(cfg_path, backup)
+    except OSError:
+        pass
+    write_json(cfg_path, cfg)
+    return f"added MCP servers: {', '.join(sorted(added))}"
+
+
+def ensure_skills() -> str:
+    """Import top-level skills that exist for Codex but not for Claude."""
+    source = Path.home() / ".agents" / "skills"
+    target = Path.home() / ".claude" / "skills"
+    if not source.is_dir() or not target.is_dir():
+        return ""
+
+    copied = []
+    for child in source.iterdir():
+        if not child.is_dir() or not (child / "SKILL.md").is_file():
+            continue
+        destination = target / child.name
+        if destination.exists():
+            continue
+        try:
+            shutil.copytree(child, destination)
+        except OSError:
+            continue
+        copied.append(child.name)
+
+    if not copied:
+        return ""
+    return f"imported {len(copied)} skill(s): {', '.join(sorted(copied))}"
+
+
 def ensure(quiet: bool = True) -> int:
     base_url = gateway_url()
     key = master_key()
@@ -131,6 +203,7 @@ def ensure(quiet: bool = True) -> int:
         print("desktop-3p: LITELLM_MASTER_KEY is not set; cannot configure the gateway", file=sys.stderr)
         return 2
 
+    notes = []
     lib = library_dir()
     lib.mkdir(parents=True, exist_ok=True)
     meta_file = lib / "_meta.json"
@@ -182,8 +255,15 @@ def ensure(quiet: bool = True) -> int:
 
     if changed:
         write_json(meta_file, meta)
-        if not quiet:
-            print(f"desktop-3p: {note}; restart Claude Desktop to apply")
+        if note:
+            notes.append(note)
+
+    for extra in (ensure_mcp_servers(), ensure_skills()):
+        if extra:
+            notes.append(extra)
+
+    if notes and not quiet:
+        print("desktop-3p: " + "; ".join(notes) + "; restart Claude Desktop to apply")
     elif not quiet:
         print("desktop-3p: already correct")
     return 0
@@ -215,6 +295,11 @@ def status() -> int:
     print(f"url     : {url or '(unset)'}")
     print(f"auth    : {settings.get('inferenceGatewayAuthScheme') or '(unset)'}")
     print(f"key     : {'set (' + str(len(key)) + ' chars)' if isinstance(key, str) and key else '(missing)'}")
+
+    desktop_cfg = read_json(desktop_config_path(), {})
+    servers = desktop_cfg.get("mcpServers") if isinstance(desktop_cfg, dict) else {}
+    print(f"mcp     : {len(servers) if isinstance(servers, dict) else 0} servers")
+    print(f"skills  : {sum(1 for _ in (Path.home() / '.claude' / 'skills').glob('*/SKILL.md'))} in ~/.claude/skills")
 
     ok = same_gateway(settings, base_url) and isinstance(key, str) and bool(key)
     print("state   : " + ("configured" if ok else "not pointing at this gateway"))

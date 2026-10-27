@@ -194,9 +194,11 @@ foreach ($guard in @('config-guard.py', 'settings-guard.py')) {
 # The Desktop app reads its gateway profile once, at launch, from
 # %LOCALAPPDATA%\Claude-3p\configLibrary. An upgrade or a profile reset drops
 # that entry and the app falls back to the claude.ai sign-in screen, which
-# reads as "the models disappeared". Re-apply the profile here so the fix is
-# automatic. The script is silent when the profile is already correct and
-# reads the key from HKCU itself.
+# reads as "the models disappeared". The same pass also re-adds the MCP
+# servers from ~/.claude.json and any skill missing from ~/.claude/skills, so
+# a profile reset cannot leave Desktop with no tools or no skills. The script
+# is silent when everything is already correct and reads the key from HKCU
+# itself.
 $desktop3p = Join-Path $claudeDir 'desktop-3p.py'
 if (Test-Path $desktop3p) {
     $out = & $python $desktop3p ensure --quiet 2>&1 | Out-String
