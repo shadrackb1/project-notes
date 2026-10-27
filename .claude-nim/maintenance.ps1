@@ -1,5 +1,6 @@
 # ---------------------------------------------------------------------------
-# Self-heal + housekeeping for the Claude Code stack.
+# Self-heal + housekeeping for the Claude and Codex stacks that run this proxy.
+# Keep both side by side; never remove the Claude Code layer to make room for Codex.
 #
 # Safe to run as often as you like: every action checks before it acts, and the
 # launchers it calls are idempotent. Scheduled every 10 minutes by
@@ -7,8 +8,8 @@
 # line in maintenance.log instead of a lost afternoon.
 #
 # What it does, in order:
-#   1. raise the stack if a layer is down (proxy, shim, watchdog)
-#   2. re-assert config.yaml and settings.json guards
+#   1. raise the stack if a layer is down (Claude proxy, shim, watchdog; Codex proxy, shim, watchdog)
+#   2. re-assert config.yaml, settings.json and the Claude Desktop gateway profile
 #   3. run doctor.py and record the result
 #   4. prune logs so the directory cannot grow without bound
 #   5. toast once when the stack is unhealthy, not once per run
@@ -18,17 +19,17 @@
 
 $ErrorActionPreference = 'Continue'
 
-$nimDir = $env:CLAUDE_PROXY_DIR
-if (-not $nimDir) { $nimDir = Join-Path ([Environment]::GetFolderPath('ApplicationData')) '.claude-nim' }
+$claudeDir = $env:CLAUDE_PROXY_DIR
+if (-not $claudeDir) { $claudeDir = Join-Path ([Environment]::GetFolderPath('ApplicationData')) '.claude-nim' }
 $python = $env:NIM_PYTHON_EXE
 if (-not $python) { $python = 'C:\Python314\python.exe' }
 if (-not (Test-Path $python)) { $python = 'python' }
 
-$log = Join-Path $nimDir 'maintenance.log'
-$state = Join-Path $nimDir 'maintenance.state'
-$health = Join-Path $nimDir 'health.json'
-$proxyProbe = 'http://127.0.0.1:8788/health/liveliness'
-$shimProbe = 'http://127.0.0.1:8791/health/liveliness'
+$log = Join-Path $claudeDir 'maintenance.log'
+$state = Join-Path $claudeDir 'maintenance.state'
+$health = Join-Path $claudeDir 'health.json'
+$claudeProxyProbe = 'http://127.0.0.1:8788/health/liveliness'
+$claudeShimProbe = 'http://127.0.0.1:8791/health/liveliness'
 
 function Write-Log($message) {
     $line = "{0} {1}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $message
@@ -55,9 +56,31 @@ function Show-Toast($message) {
         $icon = New-Object System.Windows.Forms.NotifyIcon
         $icon.Icon = [System.Drawing.SystemIcons]::Warning
         $icon.Visible = $true
+        $nui = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced')
+        $isDark = ($nui.GetValue('AppsUseLightTheme', 1) -eq 0)
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class ToastIcons {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern int SHGetStockIconInfo(int siid, int flags, IntPtr pInfo);
+}
+"@
+        $siid = 3
         $icon.ShowBalloonTip(10000, 'Claude Code stack', $message, [System.Windows.Forms.ToolTipIcon]::Warning)
-        Start-Sleep -Seconds 6
+
+        Start-Sleep -Seconds 1
         $icon.Dispose()
+
+        $codexIcon = New-Object System.Windows.Forms.NotifyIcon
+        $codexIcon.Icon = [System.Drawing.SystemIcons]::Information
+        $codexIcon.Visible = $true
+        $codexIcon.ShowBalloonTip(10000, 'Codex stack', $message, [System.Windows.Forms.ToolTipIcon]::Information)
+
+        Start-Sleep -Seconds 1
+        $codexIcon.Dispose()
+
+
     } catch {
         # A toast is a courtesy; never let it fail the maintenance run.
     }
@@ -91,40 +114,93 @@ try {
     Write-Log "could not inspect processes: $($_.Exception.Message)"
 }
 
-$proxyUp = Test-Url $proxyProbe
-$shimUp = Test-Url $shimProbe
+$claudeProxyUp = Test-Url $claudeProxyProbe
+$claudeShimUp = Test-Url $claudeShimProbe
 
-if (-not $proxyUp -and -not $watchdog) {
-    Write-Log 'proxy down and no watchdog: starting the stack'
+if (-not $claudeProxyUp -and -not $watchdog) {
+    Write-Log 'claude proxy down and no watchdog: starting the stack'
     try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $nimDir 'start-proxy.ps1') | Out-Null
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $claudeDir 'start-proxy.ps1') | Out-Null
     } catch {
         Write-Log "start-proxy.ps1 threw: $($_.Exception.Message)"
     }
-    $proxyUp = Test-Url $proxyProbe
-} elseif (-not $proxyUp) {
-    Write-Log 'proxy not answering; watchdog owns the restart, leaving it alone'
+    $claudeProxyUp = Test-Url $claudeProxyProbe
+} elseif (-not $claudeProxyUp) {
+    Write-Log 'claude proxy not answering; watchdog owns the restart, leaving it alone'
 }
 
-if (-not $shimUp) {
-    Write-Log 'shim not answering: starting it'
-    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + (Join-Path $nimDir 'start-compat.vbs') + '"') -WindowStyle Hidden
+if (-not $claudeShimUp) {
+    Write-Log 'claude shim not answering: starting it'
+    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + (Join-Path $claudeDir 'start-compat.vbs') + '"') -WindowStyle Hidden
     Start-Sleep -Seconds 3
-    $shimUp = Test-Url $shimProbe
+    $claudeShimUp = Test-Url $claudeShimProbe
 }
 
 if (-not $watchdog) {
-    Write-Log 'watchdog not running: starting it'
-    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + (Join-Path $nimDir 'start-watchdog.vbs') + '"') -WindowStyle Hidden
+    Write-Log 'claude watchdog not running: starting it'
+    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + (Join-Path $claudeDir 'start-watchdog.vbs') + '"') -WindowStyle Hidden
 }
 
-# Both guards are idempotent: they restore the known-good state only when the
+# --- codex stack -----------------------------------------------------------
+# Codex is a second *client* of this proxy, not a second proxy. Both clients
+# share config.yaml, the model catalog and port 8788; there is no .codex-nim.
+# Codex keeps no guard scripts of its own, so the only thing to verify is its
+# client config: a stale base_url or a default model the catalog dropped is
+# exactly the failure that looks like "Codex stopped working" with no error in
+# the app.
+$masterKey = $env:LITELLM_MASTER_KEY
+if (-not $masterKey) { $masterKey = [Environment]::GetEnvironmentVariable('LITELLM_MASTER_KEY', 'User') }
+
+$codexConfig = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex\config.toml'
+$codexOk = $true
+if (-not (Test-Path $codexConfig)) {
+    Write-Log 'codex config missing: ~/.codex/config.toml not found'
+    $codexOk = $false
+} else {
+    $codexText = Get-Content -LiteralPath $codexConfig -Raw
+    $codexModel = [regex]::Match($codexText, '(?m)^\s*model\s*=\s*"([^"]+)"').Groups[1].Value
+    $codexProvider = [regex]::Match($codexText, '(?m)^\s*model_provider\s*=\s*"([^"]+)"').Groups[1].Value
+    if (-not $codexModel -or -not $codexProvider) {
+        Write-Log 'codex config is missing model or model_provider'
+        $codexOk = $false
+    } elseif ($codexText -notmatch 'http://127\.0\.0\.1:8788/v1') {
+        Write-Log "codex provider '$codexProvider' does not point at the shared proxy on :8788"
+        $codexOk = $false
+    } elseif ($claudeProxyUp) {
+        try {
+            $headers = @{ Authorization = "Bearer $masterKey" }
+            $served = (Invoke-RestMethod -Uri 'http://127.0.0.1:8788/v1/models' -TimeoutSec 8 -Headers $headers).data.id
+            if ($served -notcontains $codexModel) {
+                Write-Log "codex default model '$codexModel' is not served by the proxy"
+                $codexOk = $false
+            }
+        } catch {
+            Write-Log "could not read the model catalog for the codex check: $($_.Exception.Message)"
+            $codexOk = $false
+        }
+    }
+}
+
+# Both stacks are idempotent: they restore the known-good state only when the
 # live file has drifted, and they say so.
 foreach ($guard in @('config-guard.py', 'settings-guard.py')) {
-    $path = Join-Path $nimDir $guard
+    $path = Join-Path $claudeDir $guard
     if (-not (Test-Path $path)) { continue }
     $out = & $python $path 2>&1 | Out-String
     if ($out.Trim()) { Write-Log ("{0}: {1}" -f $guard, ($out.Trim() -replace "`r?`n", ' | ')) }
+}
+
+# --- Claude Desktop (third-party inference) --------------------------------
+# The Desktop app reads its gateway profile once, at launch, from
+# %LOCALAPPDATA%\Claude-3p\configLibrary. An upgrade or a profile reset drops
+# that entry and the app falls back to the claude.ai sign-in screen, which
+# reads as "the models disappeared". Re-apply the profile here so the fix is
+# automatic. The script is silent when the profile is already correct and
+# reads the key from HKCU itself.
+$desktop3p = Join-Path $claudeDir 'desktop-3p.py'
+if (Test-Path $desktop3p) {
+    $out = & $python $desktop3p ensure --quiet 2>&1 | Out-String
+    if ($out.Trim()) { Write-Log ("desktop-3p: " + ($out.Trim() -replace "`r?`n", ' | ')) }
 }
 
 # --- python3 alias ---------------------------------------------------------
@@ -148,7 +224,7 @@ if ((Test-Path $pyHome) -and (Test-Path (Split-Path $py3))) {
     }
 }
 
-$doctorOut = & $python (Join-Path $nimDir 'doctor.py') 2>&1 | Out-String
+$doctorOut = & $python (Join-Path $claudeDir 'doctor.py') 2>&1 | Out-String
 $doctorExit = $LASTEXITCODE
 if ($doctorExit -ne 0) {
     Write-Log ("doctor found problems: {0}" -f ($doctorOut.Trim() -replace "`r?`n", ' | '))
@@ -158,24 +234,24 @@ if ($doctorExit -ne 0) {
 # The proxy writes a fresh log per start; keep the newest 20 and drop anything
 # older than two weeks so the folder stays readable.
 $cutoff = (Get-Date).AddDays(-14)
-Get-ChildItem -LiteralPath $nimDir -Filter 'litellm-*.log' -ErrorAction SilentlyContinue |
+Get-ChildItem -LiteralPath $claudeDir -Filter 'litellm-*.log' -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt $cutoff } |
     Remove-Item -Force -ErrorAction SilentlyContinue
-Get-ChildItem -LiteralPath $nimDir -Filter 'litellm-*.log' -ErrorAction SilentlyContinue |
+Get-ChildItem -LiteralPath $claudeDir -Filter 'litellm-*.log' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -Skip 20 |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
 # compat.log rotates at 5 MB inside the shim; this catches the case where the
 # shim was not restarted for weeks.
-$compatLog = Join-Path $nimDir 'compat.log'
+$compatLog = Join-Path $claudeDir 'compat.log'
 $info = Get-Item $compatLog -ErrorAction SilentlyContinue
 if ($info -and $info.Length -gt 4MB) {
     Set-Content -Path $compatLog -Value (Get-Content $compatLog -Tail 4000) -Encoding utf8
     Write-Log 'trimmed compat.log to its last 4000 lines'
 }
 
-$healthy = ($doctorExit -eq 0)
+$healthy = (($doctorExit -eq 0) -and $codexOk)
 $previous = 'unknown'
 if (Test-Path $state) { $previous = (Get-Content $state -Raw).Trim() }
 Set-Content -Path $state -Value ($(if ($healthy) { 'healthy' } else { 'unhealthy' })) -Encoding utf8
@@ -194,5 +270,5 @@ if (-not $healthy -and $previous -ne 'unhealthy') {
     Show-Toast ("Claude Code stack needs attention - " + $detail)
 }
 
-Write-Log ($(if ($healthy) { 'healthy' } else { 'unhealthy' }) + " (proxy=$proxyUp shim=$shimUp watchdog=$([bool]$watchdog))")
+Write-Log ($(if ($healthy) { 'healthy' } else { 'unhealthy' }) + " (claude proxy=$claudeProxyUp shim=$claudeShimUp watchdog=$([bool]$watchdog) codex=$codexOk)")
 exit $(if ($healthy) { 0 } else { 1 })

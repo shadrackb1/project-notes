@@ -48,6 +48,54 @@ State lives next to the scripts:
 | `litellm-<stamp>.log` | one per proxy start, newest 20 kept |
 | `versions.lock.json` | the versions that are known to work |
 
+## Claude Desktop
+
+The Desktop app (chat and its Code sessions) can use the same gateway as the
+CLI. Its Developer Mode calls this "third-party inference", and it stores the
+profile differently from Claude Code:
+
+* **Not** `claude_desktop_config.json`. That file registers MCP servers only;
+  an API host added there is silently ignored.
+* The profile lives in `%LOCALAPPDATA%\Claude-3p\configLibrary\`: one
+  `<uuid>.json` per profile plus `_meta.json`, whose `appliedId` selects the
+  active one. The app reads it once, at launch.
+* Desktop then talks to `compat.py` on :8791 (not :8788). The shim is the layer
+  that makes Claude-shaped model ids, server tools and repetition behave.
+
+That profile is now re-applied automatically. `maintenance.ps1` runs
+`desktop-3p.py ensure --quiet` on every pass (ten minutes, and at login
+through the keeper), so an app upgrade or a profile reset cannot leave the
+Desktop on the claude.ai sign-in screen:
+
+```powershell
+python desktop-3p.py status    # provider, URL, key presence; exit 1 if not applied
+python desktop-3p.py ensure    # write/repair the profile now
+python desktop-3p.py remove    # delete only the localhost gateway profile
+```
+
+The script reads `LITELLM_MASTER_KEY` from the process environment or
+`HKCU\Environment`, and the port from `CLAUDE_PROXY_PORT`, so it never holds a
+secret of its own. It is idempotent: on a correct profile it writes nothing
+and says nothing, which is why the maintenance log stays quiet unless
+something was actually repaired.
+
+After a change, quit the app fully (all `Claude.exe` processes) and reopen it -
+closing the window is not enough. Confirm from its own log:
+
+```text
+C:\Users\ADMIN\AppData\Local\Claude-3p\logs\main.log
+  [custom-3p] Credentials loaded { configSource: 'local', provider: 'gateway' }
+  [custom-3p] 3P mode active { provider: 'gateway' }
+  [custom-3p] Model discovery: 7 found in 481ms; picker = 7 (discovery)
+  [custom-3p] ConfigHealth recomputed { state: 'healthy', provider: 'gateway' }
+```
+
+To go back to the normal Claude account: `python desktop-3p.py remove`, then
+relaunch. The 3P mode keeps its own data directory, so the ordinary profile
+(and its chats) is untouched while this is enabled, but it is also not visible
+from inside 3P mode. Never paste an Anthropic API key into the Desktop sign-in
+screen to make this work: that bills Anthropic and does not route NIM models.
+
 ## When something breaks
 
 **`Connection refused` before the first reply.** The proxy is down.
@@ -113,10 +161,10 @@ Measured on this machine with the same loop replayed 40x as the prompt:
 
 Tool calling is unaffected: `tool_use` still comes back with parsed arguments.
 Tune it with `NIM_FREQUENCY_PENALTY` / `NIM_PRESENCE_PENALTY`; `0` disables it,
-and a value the client sets explicitly is never overwritten. `stop_guard.py`
-also catches the shape after the fact: six or more copies of one sentence in a
-single message returns exit 2 with an instruction to emit one call and no
-prose.
+and a value the client sets explicitly is never overwritten. Repetition is
+handled only by the penalty now: the old Stop hook that inspected the finished
+message caused more turn-ending errors than it prevented, so it is no longer
+registered.
 
 **"Waiting for N dynamic workflows to finish" for an hour.** Two causes, both
 capped in `settings-guard.py` now: a stalled subagent was waited on for 30
@@ -128,22 +176,40 @@ in flight at once on backends that take 60-90s per request
 four minutes and the queue stays short enough to finish.
 
 **The model describes a plan and stops.** Claude Code treats a text-only reply
-as the end of the turn. `~/.claude/hooks/stop_guard.py` catches the
-plan-without-action shape and returns exit 2, which continues the turn with an
-instruction to act. It reads the *last sentences* of the message, because that
-is where "... Let me fix it and run again." appears; an earlier version only
-looked at the first word and missed it. A final "I'll monitor them" or "I'll
-notify you when it completes" is allowed when the same turn launched an agent,
-workflow, or background shell job; with no such launch it is still a plan-only
-stop and is blocked. Check the classifier without spending a model turn:
+as the end of the turn. The Stop/SubagentStop hook that used to force a
+continuation is **removed**: when the model was already done, the hook printed
+an error and the next turn answered the complaint instead of acting. The
+agent directive in `compat.py` stays as the softer nudge, and the model picker
+is the real control (a model that plans instead of calling tools cannot be
+fixed by a hook). `settings-guard.py` deletes any stale `stop_guard.py`
+registration on every repair.
+
+**The model emits XML text instead of a tool call.** Nemotron 3 Ultra
+sometimes writes MiniMax-style `<invoke name="Write"><parameter
+name="content">...` as *text* rather than a structured `tool_use` block.
+Claude Code reads that as prose and ends the turn. `compat.py` parses complete
+`<invoke>`/`<parameter>` blocks in streaming and non-streaming responses and
+emits real `tool_use` blocks; ordinary text streams unchanged. This is the
+root-cause adapter fix, not a stop-hook rule.
+
+**The Write tool writes a truncated file.** This is the same model failure seen
+from the other side: the backend can end a Write call in the middle of a JSON
+object or Python body, and Claude Code saves whatever arrived. The tool is not
+corrupted; the argument is. `~/.claude/hooks/pre_write_guard.py` rebuilds the
+post-write file in memory and rejects it with exit 2 when `.json`, `.py` or
+`.js` would be invalid, so the model gets a readable error and retries instead
+of leaving a broken file on disk. It checks Edit and MultiEdit the same way,
+including the exact replacement. Nothing is written when the hook blocks.
+
+Check the validator without spending a model turn:
 
 ```powershell
-python ~/.claude/hooks/stop_guard.py --selftest
+python ~/.claude/hooks/pre_write_guard.py --selftest
 ```
 
-If a block seems missing, `stop_guard.log` records each one with the sentence
-that triggered it (`blocked a plan-only stop` or `blocked a degenerate stop`). `python doctor.py` reports whether the hook is registered;
-settings resets are repaired by `settings-guard.py`.
+Each block is logged to `~/.claude/hooks/write_guard.log`. `python doctor.py`
+reports the write guard and the removed stop hooks; settings resets are
+repaired by `settings-guard.py`.
 
 **`/model` shows only a few entries.** `settings.json` lost
 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` or the classifier opt-out. Both
