@@ -30,7 +30,10 @@ Code starting normally and a session that stops working:
 
   * permissions
     A ``WebSearch`` deny entry blocks the tool outright and is stripped so
-    every tool stays available.
+    every tool stays available. ``defaultMode`` is held at
+    ``bypassPermissions`` and ``blockReadsOutsideWorkingDirectories`` at
+    ``false``, because those two keys decide whether the agent acts on the
+    machine or stops to ask.
 
 The guard is additive and idempotent: unknown keys are preserved, values that
 already match are not rewritten, and nothing is printed on a clean run. A file
@@ -137,78 +140,103 @@ UNDENIED_TOOLS = (
 # instead of allowing them.
 DISABLE_AUTO_MODE = "disable"
 
-# Stop hook. The free models behind the proxy sometimes end a turn with a plan
-# ("Let me create the document now...") and no tool call, so nothing runs and
-# asking again produces another plan. stop_guard.py exits 2 on that shape,
-# which makes Claude Code continue the turn with the instruction to act.
+# Hooks. The Stop/SubagentStop guard is deliberately *removed*: it turned a
+# finished turn into an error toast, and the model answered the complaint
+# instead of doing the work. The remaining hook runs before a write and blocks
+# a truncated JSON/Python/JavaScript body, which is the actual "corrupted Write
+# tool" failure: the backend ended the tool call mid-object and Claude Code
+# saved whatever had arrived.
 HOOK_PYTHON = r"C:\Python314\python.exe"
 STOP_HOOK = os.path.join(CLAUDE_DIR, "hooks", "stop_guard.py")
 VALIDATE_HOOK = os.path.join(CLAUDE_DIR, "hooks", "validate.py")
+PRE_WRITE_HOOK = os.path.join(CLAUDE_DIR, "hooks", "pre_write_guard.py")
 
 
-def ensure_stop_hook(data: dict) -> bool:
-    """Register stop_guard.py for Stop and SubagentStop. Returns True if added."""
-    if not os.path.exists(STOP_HOOK):
-        return False
+def _strip_hooks(data: dict, event: str, needle: str) -> bool:
+    """Remove hook entries whose command mentions *needle*. True if changed."""
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
-        hooks = {}
-        data["hooks"] = hooks
-    command = '"%s" "%s"' % (HOOK_PYTHON, STOP_HOOK)
+        return False
+    entries = hooks.get(event)
+    if not isinstance(entries, list):
+        return False
+    kept_entries = []
+    changed = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            kept_entries.append(entry)
+            continue
+        inner = entry.get("hooks")
+        if not isinstance(inner, list):
+            kept_entries.append(entry)
+            continue
+        keep = [
+            hook
+            for hook in inner
+            if not (
+                isinstance(hook, dict)
+                and needle in str(hook.get("command", "")).replace("\\", "/").lower()
+            )
+        ]
+        if len(keep) != len(inner):
+            changed = True
+            if not keep:
+                continue
+            entry = dict(entry)
+            entry["hooks"] = keep
+        kept_entries.append(entry)
+    if changed:
+        if kept_entries:
+            hooks[event] = kept_entries
+        else:
+            hooks.pop(event, None)
+        if not hooks:
+            data.pop("hooks", None)
+    return changed
+
+
+def remove_stop_hooks(data: dict) -> bool:
+    """Delete stop_guard.py from Stop/SubagentStop. Returns True if removed."""
     changed = False
     for event in ("Stop", "SubagentStop"):
-        entries = hooks.get(event)
-        if not isinstance(entries, list):
-            entries = []
-            hooks[event] = entries
-            changed = True
-        present = any(
-            isinstance(entry, dict)
-            and any(
-                isinstance(hook, dict) and STOP_HOOK in str(hook.get("command", ""))
-                for hook in (entry.get("hooks") or [])
-            )
-            for entry in entries
-        )
-        if not present:
-            entries.append({"hooks": [{"type": "command", "command": command, "timeout": 20}]})
+        if _strip_hooks(data, event, "stop_guard.py"):
             changed = True
     return changed
 
 
-def ensure_validate_hook(data: dict) -> bool:
-    """Register validate.py with the absolute interpreter path.
+def remove_validate_hook(data: dict) -> bool:
+    """Delete the old advisory PostToolUse validator. Returns True if removed."""
+    return _strip_hooks(data, "PostToolUse", "validate.py")
 
-    The old entry used bare ``python``. Hooks inherit a minimal PATH when
-    Claude Code is started from an IDE or a shortcut, so the check sometimes
-    disappeared with "python is not recognized" instead of checking the write.
-    """
-    if not os.path.exists(VALIDATE_HOOK):
+
+def ensure_pre_write_hook(data: dict) -> bool:
+    """Register pre_write_guard.py for Write/Edit with an absolute Python path."""
+    if not os.path.exists(PRE_WRITE_HOOK):
         return False
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         hooks = {}
         data["hooks"] = hooks
-    entries = hooks.get("PostToolUse")
+    entries = hooks.get("PreToolUse")
     if not isinstance(entries, list):
         entries = []
-        hooks["PostToolUse"] = entries
+        hooks["PreToolUse"] = entries
 
-    command = '"%s" "%s"' % (HOOK_PYTHON, VALIDATE_HOOK)
+    command = '"%s" "%s"' % (HOOK_PYTHON, PRE_WRITE_HOOK)
     found = False
     changed = False
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         matcher = str(entry.get("matcher") or "")
-        if "Edit" not in matcher and "Write" not in matcher:
+        if "Write" not in matcher and "Edit" not in matcher:
             continue
         inner = entry.get("hooks")
         if not isinstance(inner, list):
             continue
         keep = []
         for hook in inner:
-            refers = isinstance(hook, dict) and "validate.py" in str(
+            refers = isinstance(hook, dict) and "pre_write_guard.py" in str(
                 hook.get("command", "")
             ).replace("\\", "/").lower()
             if not refers:
@@ -226,25 +254,22 @@ def ensure_validate_hook(data: dict) -> bool:
             entry["hooks"] = keep
             changed = True
 
+    entries[:] = [
+        entry
+        for entry in entries
+        if not (
+            isinstance(entry, dict)
+            and isinstance(entry.get("hooks"), list)
+            and not entry["hooks"]
+        )
+    ]
     if found:
-        kept_entries = [
-            entry
-            for entry in entries
-            if not (
-                isinstance(entry, dict)
-                and isinstance(entry.get("hooks"), list)
-                and not entry["hooks"]
-            )
-        ]
-        if len(kept_entries) != len(entries):
-            entries[:] = kept_entries
-            changed = True
         return changed
 
     entries.append(
         {
-            "matcher": "Edit|Write|MultiEdit",
-            "hooks": [{"type": "command", "command": command}],
+            "matcher": "Write|Edit|MultiEdit",
+            "hooks": [{"type": "command", "command": command, "timeout": 30}],
         }
     )
     return True
@@ -351,6 +376,19 @@ def repair(data: dict) -> list[str]:
             allow.append(tool)
             changes.append(f"allow {tool}")
 
+    # Full local access is the point of this machine: the user asked for a
+    # Claude that runs tools instead of asking permission for each one, and
+    # that can read a file outside the folder the session was opened in. Both
+    # keys are ordinary preferences, so a settings rewrite (a reset, a new
+    # profile, a crash during save) silently puts every action back behind a
+    # prompt. Re-assert them here so the posture survives.
+    if permissions.get("defaultMode") != "bypassPermissions":
+        permissions["defaultMode"] = "bypassPermissions"
+        changes.append("permissions.defaultMode=bypassPermissions")
+    if permissions.get("blockReadsOutsideWorkingDirectories") is not False:
+        permissions["blockReadsOutsideWorkingDirectories"] = False
+        changes.append("permissions.blockReadsOutsideWorkingDirectories=false")
+
     # The top-level window applies to every model that has no per-model
     # override. Set it here as well as in env: env is what Claude Code reads,
     # but a settings reset otherwise leaves /autocompact at the old small
@@ -359,8 +397,12 @@ def repair(data: dict) -> list[str]:
         data["autoCompactWindow"] = 1000000
         changes.append("autoCompactWindow=1000000")
 
-    # Autocompact being off is the user's choice, so it is not forced here.
-    # When it is on, the 1M window above is the ceiling.
+    # Autocompact must stay off: the user runs long sessions and the summary
+    # loses the exact instructions they are working from. The 1M window above
+    # is still set as a belt-and-braces ceiling for a future client version.
+    if data.get("autoCompactEnabled") is not False:
+        data["autoCompactEnabled"] = False
+        changes.append("autoCompactEnabled=false")
 
     if data.get("fastMode") is not True:
         data["fastMode"] = True
@@ -376,10 +418,14 @@ def repair(data: dict) -> list[str]:
         data.pop("autoMode", None)
         changes.append("removed stale autoMode environment block")
 
-    if ensure_stop_hook(data):
-        changes.append("registered the Stop/SubagentStop guard hook")
-    if ensure_validate_hook(data):
-        changes.append("registered the PostToolUse validator with the absolute Python path")
+    if remove_stop_hooks(data):
+        changes.append("removed the Stop/SubagentStop guard hooks")
+    if remove_validate_hook(data):
+        changes.append("removed the old PostToolUse validator")
+    if not os.path.exists(PRE_WRITE_HOOK):
+        changes.append("pre_write_guard.py is missing; write validation is off")
+    elif ensure_pre_write_hook(data):
+        changes.append("registered the PreToolUse write validator")
 
     return changes
 
