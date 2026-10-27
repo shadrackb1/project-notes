@@ -158,22 +158,35 @@ back into the model's context, so the next turn is worse, and it gets likelier
 as the context fills.
 
 The shim adds the repetition penalties Claude Code never sends, in
-`tame_repetition()` (`compat.py`):
+`tame_repetition()` (`compat.py`). The value matters more than it looks: a
+penalty discounts the tokens the answer is built from, and at 0.6 it was
+eating characters inside generated code.
 
 ```
-frequency_penalty 0.6   presence_penalty 0.3
+frequency_penalty 0.2   presence_penalty 0.1
 ```
 
-Measured on this machine with the same loop replayed 40x as the prompt:
+Loop, measured with the same degenerate message replayed 40x as the prompt:
 
 | | repeats of one sentence | output | latency |
 | --- | --- | --- | --- |
 | no penalty | 512 (budget exhausted) | 18,431 chars | 40.7s |
-| penalty | 9-11 | 1-4 KB | 2s |
+| penalty 0.6 | 9-11 | 1-4 KB | 2s |
 
-Tool calling is unaffected: `tool_use` still comes back with parsed arguments.
-Tune it with `NIM_FREQUENCY_PENALTY` / `NIM_PRESENCE_PENALTY`; `0` disables it,
-and a value the client sets explicitly is never overwritten. Repetition is
+Code, measured the same way - "write a 120-line `analysis.py`, use the Write
+tool", 4 samples each, the returned file checked with `ast.parse`:
+
+| frequency/presence | valid files | what broke |
+| --- | --- | --- |
+| 0.6 / 0.3 (old default) | 0 of 4 | missing `=`, unterminated string, stray U+FEFF, invalid syntax |
+| 0.2 / 0.1 (now) | 3 of 3 | - |
+| 0 (off) | 4 of 4 | - |
+
+That 0-for-4 was the "Claude writes a script, it is corrupted, then it gives up
+and only describes what it would do" failure: the model was not hallucinating
+about its own bugs, it was reading back files whose operators had been
+penalised away. Any client that sets its own penalty still wins.
+Tune it with `NIM_FREQUENCY_PENALTY` / `NIM_PRESENCE_PENALTY`; `0` disables it. Repetition is
 handled only by the penalty now: the old Stop hook that inspected the finished
 message caused more turn-ending errors than it prevented, so it is no longer
 registered.

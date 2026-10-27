@@ -4,7 +4,7 @@
 # against this account's key) and the alias map in build_config.py.
 # Regenerate with:  python build_config.py && python config-guard.py
 #
-# Callable chat models: 12 general, 3 specialist.
+# Callable chat models: 11 general, 3 specialist.
 #
 # Do not hand-edit a fallback list into `[]`: LiteLLM accepts that, and it
 # silently disables failover, so one 429 ends the turn. config-guard.py
@@ -37,11 +37,20 @@ litellm_settings:
     - "claude-opus-5.5": ["nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
     - "claude-sonnet-5.5": ["nvidia/nemotron-3-ultra-550b-a55b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
     - "claude-haiku-5.5": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview"]
-    - "nvidia/nemotron-3-ultra-550b-a55b": ["nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b", "z-ai/glm-5.3-flash"]
-    - "nvidia/nemotron-3.5-super-vl-120b-a12b": ["nvidia/nemotron-3-ultra-550b-a55b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b", "z-ai/glm-5.3-flash"]
-    - "stepfun-ai/step-5-preview": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "meta/muse-glimmer-30b", "z-ai/glm-5.3-flash"]
-    - "meta/muse-glimmer-30b": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "z-ai/glm-5.3-flash"]
-    - "z-ai/glm-5.3-flash": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
+    - "gpt-6-astra": ["nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
+    - "gpt-6.1-sol": ["nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
+    - "gpt-6-sol": ["nvidia/nemotron-3-ultra-550b-a55b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
+    - "gpt-6-luna": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview"]
+    - "gpt-5.6-sol": ["nvidia/nemotron-3-ultra-550b-a55b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
+    - "gpt-5.6-terra": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "meta/muse-glimmer-30b"]
+    - "gpt-5.6-luna": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview"]
+    - "gpt-5.5": ["nvidia/nemotron-3-ultra-550b-a55b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
+    - "gpt-daybreak-blue-latest": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview"]
+    - "gpt-daybreak-red-latest": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview"]
+    - "nvidia/nemotron-3-ultra-550b-a55b": ["nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b", "openai/gpt-oss-20b"]
+    - "nvidia/nemotron-3.5-super-vl-120b-a12b": ["nvidia/nemotron-3-ultra-550b-a55b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b", "openai/gpt-oss-20b"]
+    - "stepfun-ai/step-5-preview": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "meta/muse-glimmer-30b", "openai/gpt-oss-20b"]
+    - "meta/muse-glimmer-30b": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "openai/gpt-oss-20b"]
     - "openai/gpt-oss-20b": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
     - "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
     - "nvidia/nemotron-3.5-lightning-30b-a3b": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3.5-super-vl-120b-a12b", "stepfun-ai/step-5-preview", "meta/muse-glimmer-30b"]
@@ -124,6 +133,88 @@ model_list:
       model: nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b
       api_key: os.environ/NVIDIA_API_KEY_2
 
+  # ---- Codex CLI aliases (slugs from `codex debug models`) ----
+  - model_name: gpt-6-astra
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-6-astra
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-6.1-sol
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-6.1-sol
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-6-sol
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-6-sol
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-6-luna
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-6-luna
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-5.6-sol
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-5.6-sol
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-5.6-terra
+    litellm_params:
+      model: nvidia_nim/stepfun-ai/step-5-preview
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-5.6-terra
+    litellm_params:
+      model: nvidia_nim/stepfun-ai/step-5-preview
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-5.6-luna
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-5.6-luna
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-5.5
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-5.5
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-daybreak-blue-latest
+    litellm_params:
+      model: nvidia_nim/openai/gpt-oss-20b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-daybreak-blue-latest
+    litellm_params:
+      model: nvidia_nim/openai/gpt-oss-20b
+      api_key: os.environ/NVIDIA_API_KEY_2
+  - model_name: gpt-daybreak-red-latest
+    litellm_params:
+      model: nvidia_nim/meta/muse-glimmer-30b
+      api_key: os.environ/NVIDIA_API_KEY
+  - model_name: gpt-daybreak-red-latest
+    litellm_params:
+      model: nvidia_nim/meta/muse-glimmer-30b
+      api_key: os.environ/NVIDIA_API_KEY_2
+
   # ---- NVIDIA models verified callable for this account ----
   - model_name: nvidia/nemotron-3-ultra-550b-a55b
     litellm_params:
@@ -156,14 +247,6 @@ model_list:
   - model_name: meta/muse-glimmer-30b
     litellm_params:
       model: nvidia_nim/meta/muse-glimmer-30b
-      api_key: os.environ/NVIDIA_API_KEY_2
-  - model_name: z-ai/glm-5.3-flash
-    litellm_params:
-      model: nvidia_nim/z-ai/glm-5.3-flash
-      api_key: os.environ/NVIDIA_API_KEY
-  - model_name: z-ai/glm-5.3-flash
-    litellm_params:
-      model: nvidia_nim/z-ai/glm-5.3-flash
       api_key: os.environ/NVIDIA_API_KEY_2
   - model_name: openai/gpt-oss-20b
     litellm_params:

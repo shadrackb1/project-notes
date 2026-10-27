@@ -35,6 +35,14 @@ SPECIALIST = {
     "nvidia/riva-translate-4b-instruct-v2",
 }
 
+# Endpoints still listed as working in probe_results.json that have since
+# stopped answering: the request hangs past the client timeout without an HTTP
+# error, so no fallback ever fires (verified 2026-10-27 on gpt-daybreak-blue).
+# Kept out of the catalog so neither an alias nor a fallback chain routes here.
+BROKEN = {
+    "z-ai/glm-5.3-flash",
+}
+
 # Preference order for the general assistant chain. Anything that answered but
 # is not named here is appended after these, so a newly deployed model still
 # becomes available without editing this list.
@@ -44,7 +52,6 @@ PREFERRED = [
     "stepfun-ai/step-5-preview",
     "meta/muse-glimmer-30b",
     "z-ai/glm-5.3",
-    "z-ai/glm-5.3-flash",
     "openai/gpt-oss-20b",
     "deepseek-ai/deepseek-v4.1-flash",
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
@@ -75,6 +82,28 @@ ALIASES = {
     "claude-sonnet-5.5": "nvidia/nemotron-3.5-super-vl-120b-a12b",
     "claude-haiku-5.5": "nvidia/nemotron-3.5-lightning-30b-a3b",
 }
+
+# Codex CLI's model catalog (the slugs `codex debug models` prints) -> the NIM
+# model behind each one. Codex ships metadata for these ids -- display names,
+# reasoning levels, context window -- and falls back to generic metadata for
+# anything else, so matching the catalog ids keeps its /model picker and
+# reasoning controls honest while the traffic still lands on NIM.
+# `codex-auto-review` is an internal review model and gets no alias.
+CODEX_ALIASES = {
+    "gpt-6-astra": "nvidia/nemotron-3-ultra-550b-a55b",
+    "gpt-6.1-sol": "nvidia/nemotron-3-ultra-550b-a55b",
+    "gpt-6-sol": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "gpt-6-luna": "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "gpt-5.6-sol": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "gpt-5.6-terra": "stepfun-ai/step-5-preview",
+    "gpt-5.6-luna": "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "gpt-5.5": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "gpt-daybreak-blue-latest": "openai/gpt-oss-20b",
+    "gpt-daybreak-red-latest": "meta/muse-glimmer-30b",
+}
+
+# Every alias the proxy serves, Claude Code tiers first.
+ALL_ALIASES = {**ALIASES, **CODEX_ALIASES}
 
 
 def configured_key_envs() -> list[str]:
@@ -119,6 +148,7 @@ def main() -> int:
                 if model not in working:
                     working.append(model)
 
+    working = [model for model in working if model not in BROKEN]
     chat = rank(working)
     if not chat:
         print("no working models; refusing to write a config", file=sys.stderr)
@@ -177,7 +207,7 @@ def main() -> int:
     add("  turn_off_message_logging: true")
     add("  fallbacks:")
 
-    for alias, target in ALIASES.items():
+    for alias, target in ALL_ALIASES.items():
         # The alias itself may point at a model that is not callable; fall back
         # to whatever ranked first.
         primary = target if target in chat else chat[0]
@@ -219,6 +249,12 @@ def main() -> int:
         add_deployment(alias, primary)
 
     add("")
+    add("  # ---- Codex CLI aliases (slugs from `codex debug models`) ----")
+    for alias, target in CODEX_ALIASES.items():
+        primary = target if target in chat else chat[0]
+        add_deployment(alias, primary)
+
+    add("")
     add("  # ---- NVIDIA models verified callable for this account ----")
     for model in chat:
         add_deployment(model, model)
@@ -237,7 +273,10 @@ def main() -> int:
     with open(OUT, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
 
-    print(f"wrote {OUT}: {len(chat) + len(specialists)} models, {len(ALIASES)} aliases")
+    print(
+        f"wrote {OUT}: {len(chat) + len(specialists)} models, "
+        f"{len(ALIASES)} claude aliases, {len(CODEX_ALIASES)} codex aliases"
+    )
     return 0
 
 

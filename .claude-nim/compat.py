@@ -27,12 +27,15 @@ they arrive, so SSE behaviour is unchanged.
     python compat.py        # listens on :8791, forwards to :8788
 """
 
+import html
 import http.client
 import json
 import os
+import re
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM_HOST = "127.0.0.1"
@@ -64,10 +67,14 @@ SERVER_TOOL_PREFIXES = (
 # instruction is appended to the end of the system prompt, where recency gives
 # it the most weight, and only on requests that actually carry tools.
 AGENT_DIRECTIVE = (
-    "IMPORTANT: you are an autonomous coding agent. When a task requires "
-    "reading, writing or running anything, call the appropriate tool in this "
-    "same response. A reply that only describes what you are about to do ends "
-    "the turn and the work is never done."
+    "IMPORTANT: you are an autonomous coding agent. Act, do not narrate. When "
+    "a task requires reading, writing, searching or running anything, call "
+    "the appropriate tool in this same response. Never end a turn with "
+    "'Let me...', 'I'll...', 'First, I...', a colon followed by a plan, or a "
+    "summary of what you are about to do; emit the tool call instead. If you "
+    "catch yourself describing the next step, stop and call the tool now. A "
+    "reply that only describes what you are about to do ends the turn and the "
+    "work is never done."
 )
 
 # --- Repetition control -----------------------------------------------------
@@ -77,14 +84,22 @@ AGENT_DIRECTIVE = (
 # That is decoder degeneration, and it feeds itself: the loop is replayed back
 # to the model from its own history, which makes the next turn worse.
 #
-# Claude Code never sends a repetition penalty, so the shim adds one. Measured
-# on this machine with the same loop replayed 40x as the prompt:
-#   plain    -> 512 repeats (token budget exhausted), 18,431 chars, 40.7s
-#   penalty  -> 9-10 repeats, 1-4 KB, 3.5-12.8s
-# Tool calling is unaffected: `tool_use` still comes back with parsed
-# arguments. Set NIM_FREQUENCY_PENALTY=0 to turn it off.
-REPETITION_PENALTY = float(os.environ.get("NIM_FREQUENCY_PENALTY", "0.6"))
-PRESENCE_PENALTY = float(os.environ.get("NIM_PRESENCE_PENALTY", "0.3"))
+# Claude Code never sends a repetition penalty, so the shim adds one - but the
+# penalty is itself a correctness hazard, so it stays small. Measured on this
+# machine, same prompt ("write a 120-line analysis.py, use the Write tool"),
+# 4 samples each, checking the returned file with ast.parse:
+#   0.6/0.3 -> 4 of 4 SYNTAX ERRORS: missing operator after a bare name,
+#              unterminated string literal, stray U+FEFF, invalid syntax.
+#   0.2/0.1 -> 3 of 3 valid, 108-140 lines.
+#   none    -> 4 of 4 valid.
+# A frequency penalty of 0.6 discounts the very tokens Python code is made of
+# (=, quotes, indentation, common identifiers), so long file writes come back
+# with characters dropped - which is exactly what "my script got corrupted"
+# looked like from the Claude Desktop side. 0.2/0.1 is the trade: still caps
+# the runaway loop, still emits intact code.
+# Set NIM_FREQUENCY_PENALTY=0 / NIM_PRESENCE_PENALTY=0 to turn either off.
+REPETITION_PENALTY = float(os.environ.get("NIM_FREQUENCY_PENALTY", "0.2"))
+PRESENCE_PENALTY = float(os.environ.get("NIM_PRESENCE_PENALTY", "0.1"))
 _penalty_announced = False
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compat.log")
@@ -472,6 +487,340 @@ def scrub(body: bytes, content_type: str) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
+# --- Native tool-call text --------------------------------------------------
+# Nemotron 3 Ultra occasionally emits its tool call as MiniMax-style XML text
+# instead of an OpenAI tool_calls / Anthropic tool_use block:
+#
+#   <minimax:tool_call>
+#   <invoke name="Read">
+#   <parameter name="file_path">/some/file</parameter>
+#   </invoke>
+#   </minimax:tool_call>
+#
+# Claude Code sees a text-only answer, ends the turn, and the stop hook fires.
+# The next turn then answers instead of acting, which is exactly the "stops
+# after the hook" behaviour. This is an adapter mismatch, not a model plan, so
+# the shim parses the markup and emits real tool_use blocks. The parser is
+# deliberately tolerant: the model also writes `name="command>` (missing quote)
+# and `<parameter=task_id>`.
+TEXT_TOOL_PREFIXES = ("<minimax:tool_call", "<invoke", "<tool_call", "<function_call")
+TEXT_TOOL_OPEN = re.compile(r"<\s*(?:minimax:)?tool_call\b", re.IGNORECASE)
+TEXT_TOOL_INVOKE = re.compile(
+    r"<\s*invoke\s+name\s*=\s*[\"']?([^\"'\s>]+)", re.IGNORECASE
+)
+TEXT_TOOL_PARAM = re.compile(
+    r"<\s*parameter\s*(?:name\s*=\s*[\"']?([^\"'\s>]+)[\"']?|=\s*([^\"'\s>]+))\s*>",
+    re.IGNORECASE,
+)
+TEXT_TOOL_PARAM_END = re.compile(r"</\s*parameter\s*>", re.IGNORECASE)
+TEXT_TOOL_INVOKE_END = re.compile(r"</\s*invoke\s*>", re.IGNORECASE)
+TEXT_TOOL_WRAPPER_END = re.compile(r"</\s*(?:minimax:)?tool_call\s*>", re.IGNORECASE)
+
+# Parameter values that are text even when they happen to look like JSON.
+TEXT_PARAMS = {
+    "content", "command", "old_string", "new_string", "prompt", "file_path",
+    "path", "pattern", "description", "task_id", "subject", "activeform",
+    "status", "query", "url", "skill", "notebook_path", "cell_id", "source",
+    "new_source", "output", "title", "message",
+}
+
+TOOL_NAMES = {
+    name.lower(): name
+    for name in (
+        "Read", "Write", "Edit", "MultiEdit", "Bash", "PowerShell", "Glob",
+        "Grep", "Task", "TaskStop", "TodoWrite", "NotebookEdit", "WebFetch",
+        "WebSearch", "Skill", "KillShell", "BashOutput", "ExitPlanMode",
+        "AskUserQuestion",
+    )
+}
+
+
+def canonical_tool(name: str) -> str:
+    return TOOL_NAMES.get(name.strip().lower(), name.strip())
+
+
+def coerce_param(key: str, value: str):
+    """Turn one <parameter> body into a tool input value.
+
+    Most Claude Code inputs are strings. Keep those verbatim (a Write body or a
+    Bash command can contain JSON that must not be parsed). Only decode a value
+    that looks like a JSON object/array for a parameter that is not a known
+    text field, which covers TodoWrite-style structured inputs.
+    """
+    if key.lower() in TEXT_PARAMS:
+        if key.lower() in {"content", "old_string", "new_string", "new_source", "source"}:
+            return value.strip("\n")
+        return value.strip()
+    stripped = value.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            return json.loads(stripped)
+        except ValueError:
+            pass
+    return stripped
+
+
+def parse_text_tool_calls(text: str) -> tuple[str, list[dict], str]:
+    """Split a response into (prefix, tool calls, suffix).
+
+    Returns the text unchanged with no calls when the response is ordinary
+    prose. Only complete <invoke> blocks are converted; a truncated block is
+    left as text so a half-written call can never turn into a fake tool use.
+    """
+    starts = [m.start() for m in TEXT_TOOL_OPEN.finditer(text)]
+    starts += [m.start() for m in TEXT_TOOL_INVOKE.finditer(text)]
+    if not starts:
+        return text, [], ""
+    first = min(starts)
+
+    calls: list[dict] = []
+    last_end = first
+    pos = first
+    while True:
+        match = TEXT_TOOL_INVOKE.search(text, pos)
+        if not match:
+            break
+        end = TEXT_TOOL_INVOKE_END.search(text, match.end())
+        if not end:
+            break
+        name = canonical_tool(html.unescape(match.group(1)))
+        body = text[match.end():end.start()]
+        params: dict = {}
+        ppos = 0
+        while True:
+            pm = TEXT_TOOL_PARAM.search(body, ppos)
+            if not pm:
+                break
+            key = html.unescape((pm.group(1) or pm.group(2) or "").strip())
+            vend = TEXT_TOOL_PARAM_END.search(body, pm.end())
+            if not vend:
+                break
+            raw_value = body[pm.end():vend.start()]
+            if raw_value.startswith("\n"):
+                raw_value = raw_value[1:]
+            if raw_value.endswith("\n"):
+                raw_value = raw_value[:-1]
+            params[key] = coerce_param(key, html.unescape(raw_value))
+            ppos = vend.end()
+        if name:
+            calls.append({"name": name, "input": params})
+        last_end = end.end()
+        pos = end.end()
+
+    if not calls:
+        return text, [], ""
+
+    suffix = text[last_end:]
+    suffix = TEXT_TOOL_WRAPPER_END.sub("", suffix, count=1)
+    return text[:first], calls, suffix
+
+
+def tool_use_block(call: dict) -> dict:
+    return {
+        "type": "tool_use",
+        "id": "toolu_" + uuid.uuid4().hex,
+        "name": call["name"],
+        "input": call["input"],
+    }
+
+
+def transform_message(message: dict) -> dict:
+    """Convert textual tool calls in a non-streaming Anthropic message."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    new_content = []
+    changed = False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            prefix, calls, suffix = parse_text_tool_calls(block.get("text") or "")
+            if calls:
+                changed = True
+                if prefix:
+                    new_content.append({"type": "text", "text": prefix})
+                new_content.extend(tool_use_block(call) for call in calls)
+                if suffix.strip():
+                    new_content.append({"type": "text", "text": suffix})
+                continue
+        new_content.append(block)
+    if changed:
+        message["content"] = new_content
+        message["stop_reason"] = "tool_use"
+        log("converted textual tool call(s) in a non-streaming response")
+    return message
+
+
+class SSETransformer:
+    """Rewrite one Anthropic SSE response while it streams.
+
+    Normal text is forwarded as it arrives. Only a suffix that could be the
+    start of a native tool tag is held back; at content_block_stop the held
+    text is parsed, and real tool_use blocks replace it when complete. That
+    keeps ordinary streaming unchanged while fixing the 5% of turns that would
+    otherwise end as text.
+    """
+
+    def __init__(self, write):
+        self.write = write
+        self.text_blocks: dict[int, dict] = {}
+        self.tool_mode = False
+        self.stop_reason = None
+
+    def emit(self, obj: dict) -> None:
+        payload = "event: %s\ndata: %s\n\n" % (
+            obj.get("type", "message"),
+            json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
+        )
+        self.write(payload.encode("utf-8"))
+
+    def emit_text(self, index: int, text: str) -> None:
+        if text:
+            self.emit({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": text},
+            })
+
+    def release(self, index: int, block: dict, final: bool = False) -> None:
+        """Forward safe text and keep only a possible native-tool tag."""
+        pending = block.get("pending", "")
+        if not pending or self.tool_mode:
+            return
+        lowered = pending.lower()
+        tag_at = None
+        for tag in TEXT_TOOL_PREFIXES:
+            pos = lowered.find(tag)
+            if pos != -1 and (tag_at is None or pos < tag_at):
+                tag_at = pos
+        if tag_at is not None:
+            if tag_at:
+                self.emit_text(index, pending[:tag_at])
+            block["pending"] = pending[tag_at:]
+            return
+
+        hold = 0
+        if not final:
+            for tag in TEXT_TOOL_PREFIXES:
+                for length in range(1, min(len(tag), len(pending)) + 1):
+                    if pending[-length:].lower() == tag[:length]:
+                        hold = max(hold, length)
+        safe = pending[:-hold] if hold else pending
+        if safe:
+            self.emit_text(index, safe)
+        block["pending"] = pending[-hold:] if hold else ""
+
+    def feed(self, raw: bytes) -> None:
+        text = raw.decode("utf-8", "replace")
+        event = ""
+        data = []
+        for line in text.splitlines():
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                data.append(line[5:].lstrip())
+        if not data:
+            if raw.strip():
+                self.write(raw.rstrip(b"\r\n") + b"\n\n")
+            return
+        try:
+            obj = json.loads("\n".join(data))
+        except ValueError:
+            self.write(raw.rstrip(b"\r\n") + b"\n\n")
+            return
+        self.handle(obj)
+
+    def handle(self, obj: dict) -> None:
+        kind = obj.get("type")
+        if kind == "content_block_start":
+            if self.tool_mode:
+                return
+            block = obj.get("content_block") or {}
+            index = int(obj.get("index", 0))
+            if block.get("type") == "text":
+                initial = block.get("text") or ""
+                start = dict(obj)
+                start["content_block"] = dict(block)
+                start["content_block"]["text"] = ""
+                self.emit(start)
+                state = {"pending": initial}
+                self.text_blocks[index] = state
+                self.release(index, state)
+            else:
+                self.emit(obj)
+        elif kind == "content_block_delta":
+            if self.tool_mode:
+                return
+            index = int(obj.get("index", 0))
+            delta = obj.get("delta") or {}
+            if delta.get("type") == "text_delta" and index in self.text_blocks:
+                state = self.text_blocks[index]
+                state["pending"] = state.get("pending", "") + (delta.get("text") or "")
+                self.release(index, state)
+            else:
+                self.emit(obj)
+        elif kind == "content_block_stop":
+            if self.tool_mode:
+                return
+            index = int(obj.get("index", 0))
+            state = self.text_blocks.pop(index, None)
+            if state is None:
+                self.emit(obj)
+                return
+            self.release(index, state, final=True)
+            pending = state.get("pending", "")
+            prefix, calls, suffix = parse_text_tool_calls(pending)
+            if not calls:
+                self.emit_text(index, pending)
+                self.emit(obj)
+                return
+
+            if prefix:
+                self.emit_text(index, prefix)
+            self.emit({"type": "content_block_stop", "index": index})
+            for offset, call in enumerate(calls, start=1):
+                new_index = index + offset
+                self.emit({
+                    "type": "content_block_start",
+                    "index": new_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_" + uuid.uuid4().hex,
+                        "name": call["name"],
+                        "input": {},
+                    },
+                })
+                self.emit({
+                    "type": "content_block_delta",
+                    "index": new_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(call["input"], ensure_ascii=False),
+                    },
+                })
+                self.emit({"type": "content_block_stop", "index": new_index})
+            if suffix.strip():
+                new_index = index + len(calls) + 1
+                self.emit({
+                    "type": "content_block_start",
+                    "index": new_index,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                self.emit_text(new_index, suffix)
+                self.emit({"type": "content_block_stop", "index": new_index})
+            self.tool_mode = True
+            self.stop_reason = "tool_use"
+            log("converted %d textual tool call(s) into tool_use" % len(calls))
+        elif kind == "message_delta":
+            if self.stop_reason:
+                obj.setdefault("delta", {})["stop_reason"] = self.stop_reason
+            self.emit(obj)
+        elif kind in ("message_stop", "ping", "error"):
+            self.emit(obj)
+        else:
+            if not self.tool_mode:
+                self.emit(obj)
+
+
 def clean_headers(headers):
     out = {}
     for key, value in headers.items():
@@ -493,6 +842,14 @@ class Shim(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def _write_chunk(self, data: bytes) -> None:
+        self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+        self.wfile.flush()
+
+    def _finish_chunks(self) -> None:
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def _fail(self, status, message):
         """Answer with a JSON error instead of dropping the connection.
@@ -570,6 +927,8 @@ class Shim(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        content_type = (resp.getheader("content-type") or "").lower()
+        content_encoding = (resp.getheader("content-encoding") or "").lower()
         self.send_response(resp.status)
         for key, value in resp.getheaders():
             if key.lower() in ("transfer-encoding", "connection", "content-length"):
@@ -581,16 +940,50 @@ class Shim(BaseHTTPRequestHandler):
         first_byte = None
         try:
             reader = getattr(resp, "read1", resp.read)
-            while True:
-                chunk = reader(8192)
-                if not chunk:
-                    break
+            transformable = content_encoding in ("", "identity")
+            if transformable and "text/event-stream" in content_type:
+                transformer = SSETransformer(self._write_chunk)
+                buffer = b""
+                while True:
+                    chunk = reader(8192)
+                    if not chunk:
+                        break
+                    if first_byte is None:
+                        first_byte = time.time() - started
+                    buffer += chunk
+                    while True:
+                        split = re.search(rb"\r?\n\r?\n", buffer)
+                        if not split:
+                            break
+                        raw_event = buffer[:split.start()]
+                        buffer = buffer[split.end():]
+                        if raw_event.strip():
+                            transformer.feed(raw_event)
+                if buffer.strip():
+                    transformer.feed(buffer)
+                self._finish_chunks()
+            elif transformable and "application/json" in content_type:
+                body = resp.read()
                 if first_byte is None:
                     first_byte = time.time() - started
-                self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+                try:
+                    payload = json.loads(body)
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict) and payload.get("type") == "message":
+                    payload = transform_message(payload)
+                    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self._write_chunk(body)
+                self._finish_chunks()
+            else:
+                while True:
+                    chunk = reader(8192)
+                    if not chunk:
+                        break
+                    if first_byte is None:
+                        first_byte = time.time() - started
+                    self._write_chunk(chunk)
+                self._finish_chunks()
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:

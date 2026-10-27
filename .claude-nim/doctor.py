@@ -177,12 +177,23 @@ def main() -> int:
     data = settings()
     env = data.get("env") or {}
     hooks = data.get("hooks") or {}
-    hook_ok = all(
-        any("stop_guard.py" in str(h.get("command", "")) for e in (hooks.get(event) or [])
-            for h in (e.get("hooks") or []))
+    stop_hooks = [
+        hook
         for event in ("Stop", "SubagentStop")
-    )
-    add("stop hook", hook_ok, "registered" if hook_ok else "NOT registered")
+        for entry in (hooks.get(event) or [])
+        for hook in (entry.get("hooks") or [])
+        if "stop_guard.py" in str(hook.get("command", ""))
+    ]
+    write_hooks = [
+        hook
+        for entry in (hooks.get("PreToolUse") or [])
+        for hook in (entry.get("hooks") or [])
+        if "pre_write_guard.py" in str(hook.get("command", ""))
+    ]
+    add("write guard", not stop_hooks and bool(write_hooks),
+        "active before Write/Edit" if not stop_hooks and write_hooks
+        else "stop hook still registered" if stop_hooks
+        else "pre_write_guard.py NOT registered")
     add("auto mode", data.get("disableAutoMode") == "disable",
         str(data.get("disableAutoMode")))
     # The aliases are native-1M models and that is also the highest window
