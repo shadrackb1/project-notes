@@ -108,6 +108,41 @@ relaunch. The 3P mode keeps its own data directory, so the ordinary profile
 from inside 3P mode. Never paste an Anthropic API key into the Desktop sign-in
 screen to make this work: that bills Anthropic and does not route NIM models.
 
+## Git
+
+Pushes from a Cowork shell used to fail twice over: `authentication (no
+credentials)`, then `remote end hung up` until the command timed out.
+
+The shell does not point `HOME` at `C:/Users/ADMIN`, so git never read
+`~/.gitconfig` and never saw the `gh` credential helper. It fell back to the
+*system* config, whose only helper is Git Credential Manager - a GUI helper.
+With nobody to answer it, `git ls-remote` blocked until `timeout` killed it
+(exit 124, measured with `HOME=/c/nonexistent-home`). Two settings fix it
+without admin rights:
+
+| Setting | Effect |
+| --- | --- |
+| `GIT_CONFIG_GLOBAL=C:\Users\ADMIN\.gitconfig` (user env) | git reads the real global config whatever `HOME` is |
+| `credential.interactive=never` (global) | GCM fails fast instead of hanging, so `gh` answers |
+
+Verified with `HOME` pointed at a nonexistent directory: `git ls-remote` and
+`git push --dry-run` both authenticate and finish instead of stalling.
+`git-guard.py` re-asserts both on every maintenance pass, so a HelperSelector
+tool or a config rewrite cannot bring the hang back.
+
+```powershell
+python git-guard.py status    # show the three settings
+python git-guard.py           # repair, silent when already correct
+```
+
+Tokens do not belong in remote URLs: `git remote set-url origin
+https://github.com/owner/repo.git` removes one, and the helper still
+authenticates after it is gone (checked on `scope-to-launch`, whose remote was
+pointing at `tchukor/scope-to-launch`). `~/.git-credentials` is a leftover
+plaintext store that no configured helper reads - it is excluded in
+`.git/info/exclude` so it cannot be committed, and the token pasted into a
+chat session should be revoked at github.com/settings/tokens.
+
 ## When something breaks
 
 **`Connection refused` before the first reply.** The proxy is down.

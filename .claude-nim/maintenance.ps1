@@ -182,8 +182,11 @@ if (-not (Test-Path $codexConfig)) {
 }
 
 # Both stacks are idempotent: they restore the known-good state only when the
-# live file has drifted, and they say so.
-foreach ($guard in @('config-guard.py', 'settings-guard.py')) {
+# live file has drifted, and they say so. git-guard.py belongs here too: it
+# re-asserts GIT_CONFIG_GLOBAL and credential.interactive, without which git
+# in a shell whose HOME points elsewhere falls back to Git Credential Manager
+# and hangs on every push.
+foreach ($guard in @('config-guard.py', 'settings-guard.py', 'git-guard.py')) {
     $path = Join-Path $claudeDir $guard
     if (-not (Test-Path $path)) { continue }
     $out = & $python $path 2>&1 | Out-String
