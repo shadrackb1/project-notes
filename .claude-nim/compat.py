@@ -40,7 +40,36 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM_HOST = "127.0.0.1"
 UPSTREAM_PORT = 8788
+# Two LiteLLM instances run the same config on adjacent ports (run-proxy.bat
+# takes the port as its third argument). The shim prefers whichever answers,
+# so a proxy that is restarting — or one that wedged before binding its socket,
+# which is exactly what happened on 2026-10-28 — costs a few milliseconds
+# instead of failing the turn.
+UPSTREAM_PORTS = (8788, 8789)
 PORT = 8791
+
+# A port that just refused a connection is tried last for a short while, so
+# requests during a restart do not each pay the dead port's timeout first.
+_upstream_down: dict[int, float] = {}
+_upstream_down_lock = threading.Lock()
+
+
+def upstream_ports() -> tuple:
+    """Candidate upstream ports, ones that recently failed last."""
+    now = time.time()
+    with _upstream_down_lock:
+        dead = {port for port, until in _upstream_down.items() if until > now}
+    healthy = [port for port in UPSTREAM_PORTS if port not in dead]
+    return tuple(healthy + [port for port in UPSTREAM_PORTS if port in dead])
+
+
+def note_upstream(port: int, ok: bool) -> None:
+    """Remember which upstream answered, and for how long to distrust it."""
+    with _upstream_down_lock:
+        if ok:
+            _upstream_down.pop(port, None)
+        else:
+            _upstream_down[port] = time.time() + 15
 
 DROP_BODY_KEYS = ("speed",)
 
@@ -194,18 +223,26 @@ def served_models(force: bool = False) -> set:
         if not force and time.time() < _served["retry_at"]:
             return _served["names"]
         names = set()
-        try:
-            conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=5)
-            conn.request("GET", "/v1/models", headers=dict(_auth))
-            payload = json.loads(conn.getresponse().read() or b"{}")
-            conn.close()
-            for entry in payload.get("data") or []:
-                name = entry.get("id") if isinstance(entry, dict) else None
-                if name:
-                    names.add(name)
-        except Exception as exc:
+        last_exc = None
+        payload = {}
+        for port in upstream_ports():
+            try:
+                conn = http.client.HTTPConnection(UPSTREAM_HOST, port, timeout=5)
+                conn.request("GET", "/v1/models", headers=dict(_auth))
+                payload = json.loads(conn.getresponse().read() or b"{}")
+                conn.close()
+                note_upstream(port, True)
+                break
+            except Exception as exc:
+                last_exc = exc
+                note_upstream(port, False)
+        if not payload and last_exc is not None:
             _served["retry_at"] = time.time() + 5
-            log("could not list upstream models: %s" % exc)
+            log("could not list upstream models: %s" % last_exc)
+        for entry in payload.get("data") or []:
+            name = entry.get("id") if isinstance(entry, dict) else None
+            if name:
+                names.add(name)
         if names:
             _served["names"] = names
             _served["at"] = time.time()
@@ -898,26 +935,35 @@ class Shim(BaseHTTPRequestHandler):
         if body:
             headers["Content-Length"] = str(len(body))
 
-        conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=900)
+        conn = None
         resp = None
         last_error = None
-        # The proxy is restarted on every config change and by the watchdog.
-        # A short retry here turns "connection refused" into a normal answer
-        # instead of a 502 the client has to give up on.
-        for attempt in range(3):
-            try:
-                conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=900)
-                conn.request(self.command, self.path, body=body or None, headers=headers)
-                resp = conn.getresponse()
-                break
-            except Exception as exc:  # upstream down or restarting
-                last_error = exc
+        # Failover across the two proxy instances. Both are restarted on config
+        # changes and by the watchdog, and either can wedge before binding; a
+        # retry against the other one turns "connection refused" into a normal
+        # answer instead of a 502 the client has to give up on. The connection
+        # is only established here — once the response is streaming there is no
+        # second copy of the request to replay, so a mid-stream failure still
+        # surfaces to the client.
+        for port in upstream_ports():
+            for attempt in range(2):
                 try:
-                    conn.close()
-                except Exception:
-                    pass
-                if attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
+                    conn = http.client.HTTPConnection(UPSTREAM_HOST, port, timeout=900)
+                    conn.request(self.command, self.path, body=body or None, headers=headers)
+                    resp = conn.getresponse()
+                    note_upstream(port, True)
+                    break
+                except Exception as exc:  # this instance is down or restarting
+                    last_error = exc
+                    note_upstream(port, False)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    if attempt < 1:
+                        time.sleep(0.6)
+            if resp is not None:
+                break
         if resp is None:
             payload = json.dumps({"error": {"type": "upstream_unreachable", "message": str(last_error)}}).encode()
             self.send_response(502)
@@ -1032,6 +1078,10 @@ if __name__ == "__main__":
         # Another copy already holds the port: nothing to do.
         log("port %d unavailable (%s); exiting" % (port, exc))
         sys.exit(0)
-    print(f"compat shim on 127.0.0.1:{port} -> {UPSTREAM_HOST}:{UPSTREAM_PORT}", flush=True)
+    print(
+        "compat shim on 127.0.0.1:%d -> %s:%s"
+        % (port, UPSTREAM_HOST, ", ".join(str(p) for p in UPSTREAM_PORTS)),
+        flush=True,
+    )
     log("shim listening on %d" % port)
     server.serve_forever()

@@ -21,6 +21,12 @@ REM Kept for compatibility with callers that still pass a worker count.
 set WORKERS=%~2
 if "%WORKERS%"=="" set WORKERS=1
 
+REM Port for this instance. Two instances run side by side (8788 primary,
+REM 8789 standby) so a wedged proxy no longer takes the whole toolchain down:
+REM the shim on 8791 fails over to whichever one answers.
+set PORT=%~3
+if "%PORT%"=="" set PORT=8788
+
 REM Load environment variables from .env file
 for /f "usebackq tokens=1* delims==" %%a in ("%~dp0.env") do (
     if not "%%a"=="" if not "%%a:~0,1%"=="#" (
@@ -30,6 +36,13 @@ for /f "usebackq tokens=1* delims==" %%a in ("%~dp0.env") do (
 
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
+
+REM Use the model cost map bundled with the package instead of fetching it from
+REM GitHub at import time. Without this, a slow or filtered connection stalls
+REM the import for minutes before the first log line is written, and the result
+REM is indistinguishable from a dead proxy: zero-byte log, no listener on 8788,
+REM and both Claude Code and Codex reporting connection errors.
+set LITELLM_LOCAL_MODEL_COST_MAP=True
 
 set LITELLM_EXE=%LITELLM_EXE:C:\Users\ADMIN\AppData\Roaming\Python\Python314\Scripts\=%
 if "%LITELLM_EXE%"=="" set LITELLM_EXE=%LOCALAPPDATA%\Python\Python314\Scripts\litellm.exe
@@ -41,4 +54,4 @@ REM subagent requests it reset connections mid-body, which LiteLLM logged as
 REM ClientDisconnect and answered with "Missing required parameter: messages".
 REM It also hung before binding the port on two restarts, leaving a zero-byte
 REM log and no listener. Uvicorn is single-process and handles the same load.
-"%LITELLM_EXE%" --config "%CONFIG%" --port 8788 --host 127.0.0.1 > "%~1" 2>&1
+"%LITELLM_EXE%" --config "%CONFIG%" --port %PORT% --host 127.0.0.1 > "%~1" 2>&1

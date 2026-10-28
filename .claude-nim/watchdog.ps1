@@ -71,6 +71,22 @@ function Test-Shim {
     }
 }
 
+# The standby proxy: a second LiteLLM instance running the same config on 8789.
+# compat.py fails over between the two, so keeping both up is what turns "the
+# proxy died" from an outage into a blip the client never sees.
+$standbyProbe = $env:CLAUDE_PROXY_STANDBY_URL
+if (-not $standbyProbe) { $standbyProbe = 'http://127.0.0.1:8789/health/liveliness' }
+$standbyStarter = Join-Path $nimDir 'start-proxy2.ps1'
+
+function Test-Standby {
+    try {
+        $null = Invoke-RestMethod -Uri $standbyProbe -TimeoutSec 4
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Start-Shim {
     # Launched through wscript so the shim is not a child of this process: a
     # direct Start-Process copy dies with the watchdog if the watchdog is
@@ -104,6 +120,7 @@ if (-not $owned) {
 Write-Log 'watchdog started'
 $failures = 0
 $shimFailures = 0
+$standbyFailures = 0
 
 while ($true) {
     $healthy = Test-Proxy
@@ -121,16 +138,32 @@ while ($true) {
     } else {
         $failures++
         Write-Log "proxy not answering (failure $failures); restarting"
-        try {
-            & powershell -NoProfile -ExecutionPolicy Bypass -File $starter | Out-Null
-        } catch {
-            Write-Log "start-proxy.ps1 threw: $($_.Exception.Message)"
+        # Three short attempts instead of one long one. A single failed start
+        # used to leave both Claude Code and Codex dead until the next 60s tick,
+        # and a start that crashed early (the Unicode banner, see
+        # start-proxy.ps1) failed identically every time unless the attempt was
+        # retried with the log inspected.
+        #
+        # Output goes to a file, never a pipe: if the child inherits this
+        # process's stdout handle the restart blocks until the proxy exits,
+        # which is forever. That made automatic restarts silently stop working.
+        $recovered = $false
+        $starterLog = Join-Path $nimDir 'start-proxy.out.log'
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $starter *> $starterLog
+            } catch {
+                Write-Log "start-proxy.ps1 threw: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 5
+            if (Test-Proxy) {
+                Write-Log "proxy recovered (attempt $attempt)"
+                $failures = 0
+                $recovered = $true
+                break
+            }
         }
-        Start-Sleep -Seconds $grace
-        if (Test-Proxy) {
-            Write-Log 'proxy recovered'
-            $failures = 0
-        } else {
+        if (-not $recovered) {
             Write-Log 'restart did not bring the proxy back'
             # A restart that fails with an empty log means the proxy never
             # reached startup; a restart that fails with output means it
@@ -167,6 +200,40 @@ while ($true) {
             Write-Log 'restart did not bring the shim back'
         }
     }
+
+    # --- standby proxy -----------------------------------------------------
+    if (Test-Standby) {
+        if ($standbyFailures -gt 0) { Write-Log 'standby proxy healthy again'; $standbyFailures = 0 }
+    } else {
+        $standbyFailures++
+        Write-Log "standby proxy not answering (failure $standbyFailures); starting it"
+        # Output to a file, never a pipe: the child would otherwise inherit this
+        # process's stdout handle and the start would block until the proxy exits.
+        $standbyStarterLog = Join-Path $nimDir 'start-proxy2.out.log'
+        try {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $standbyStarter *> $standbyStarterLog
+        } catch {
+            Write-Log "start-proxy2.ps1 threw: $($_.Exception.Message)"
+        }
+        Start-Sleep -Seconds 3
+        if (Test-Standby) {
+            Write-Log 'standby proxy recovered'
+            $standbyFailures = 0
+        } else {
+            Write-Log 'standby proxy did not come back; the primary still serves'
+        }
+    }
+
+    # Heartbeat. maintenance.ps1 used to treat "a watchdog process exists" as
+    # "the watchdog is working", and one copy wedged inside a PowerShell
+    # pipeline did nothing for 25 minutes while maintenance kept deferring to
+    # it: the proxy stayed down and every client failed. The timestamp of this
+    # file is the only evidence that the loop is still turning, because a
+    # healthy loop logs nothing.
+    try {
+        Set-Content -LiteralPath (Join-Path $nimDir 'watchdog.heartbeat') `
+            -Value (Get-Date -Format 'o') -Encoding ascii -ErrorAction SilentlyContinue
+    } catch { }
 
     Start-Sleep -Seconds $interval
 }

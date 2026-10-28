@@ -114,11 +114,34 @@ try {
     Write-Log "could not inspect processes: $($_.Exception.Message)"
 }
 
+# A watchdog process is not a working watchdog. On 2026-10-28 one copy sat
+# blocked forever inside a PowerShell pipeline (its restart piped start-proxy
+# into Out-Null, so the child inherited the pipe and the parent waited for the
+# proxy to exit). This script saw the process, deferred to it, and logged
+# "watchdog owns the restart" every ten minutes for 25 minutes while the proxy
+# stayed down and both Claude Code and Codex failed. The watchdog now writes a
+# heartbeat file each cycle; only a recent one proves the loop is still turning.
+$watchdogFresh = $false
+if ($watchdog) {
+    $heartbeat = Join-Path $claudeDir 'watchdog.heartbeat'
+    $hb = Get-Item -LiteralPath $heartbeat -ErrorAction SilentlyContinue
+    if ($hb) {
+        $quietMinutes = ((Get-Date) - $hb.LastWriteTime).TotalMinutes
+        if ($quietMinutes -lt 4) {
+            $watchdogFresh = $true
+        } else {
+            Write-Log ("watchdog process exists but has not heartbeat for {0:N0} min; treating it as stuck" -f $quietMinutes)
+        }
+    } else {
+        Write-Log 'watchdog process exists but wrote no heartbeat; treating it as stuck'
+    }
+}
+
 $claudeProxyUp = Test-Url $claudeProxyProbe
 $claudeShimUp = Test-Url $claudeShimProbe
 
-if (-not $claudeProxyUp -and -not $watchdog) {
-    Write-Log 'claude proxy down and no watchdog: starting the stack'
+if (-not $claudeProxyUp -and -not $watchdogFresh) {
+    Write-Log 'claude proxy down and no working watchdog: starting the stack'
     try {
         & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $claudeDir 'start-proxy.ps1') | Out-Null
     } catch {
@@ -136,7 +159,33 @@ if (-not $claudeShimUp) {
     $claudeShimUp = Test-Url $claudeShimProbe
 }
 
-if (-not $watchdog) {
+# The standby proxy on 8789 is what the shim falls back to when the primary
+# wedges. The watchdog keeps it up; this is the second pair of hands for the
+# case where the watchdog itself is being replaced in this same run.
+$standbyProbe = 'http://127.0.0.1:8789/health/liveliness'
+$standbyUp = Test-Url $standbyProbe
+if (-not $standbyUp) {
+    Write-Log 'standby proxy not answering: starting it'
+    try {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $claudeDir 'start-proxy2.ps1') *> (Join-Path $claudeDir 'start-proxy2.out.log')
+    } catch {
+        Write-Log "start-proxy2.ps1 threw: $($_.Exception.Message)"
+    }
+    $standbyUp = Test-Url $standbyProbe
+}
+
+if (-not $watchdog -or -not $watchdogFresh) {
+    if ($watchdog -and -not $watchdogFresh) {
+        # Killing it is safe: the proxy is started above when the watchdog is not
+        # trusted, and the new copy takes over the same mutex.
+        Write-Log 'replacing the stuck watchdog'
+        try {
+            Stop-Process -Id $watchdog.ProcessId -Force -ErrorAction Stop
+        } catch {
+            Write-Log "could not stop the stuck watchdog: $($_.Exception.Message)"
+        }
+        Start-Sleep -Seconds 2
+    }
     Write-Log 'claude watchdog not running: starting it'
     Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + (Join-Path $claudeDir 'start-watchdog.vbs') + '"') -WindowStyle Hidden
 }
@@ -163,8 +212,12 @@ if (-not (Test-Path $codexConfig)) {
     if (-not $codexModel -or -not $codexProvider) {
         Write-Log 'codex config is missing model or model_provider'
         $codexOk = $false
-    } elseif ($codexText -notmatch 'http://127\.0\.0\.1:8788/v1') {
-        Write-Log "codex provider '$codexProvider' does not point at the shared proxy on :8788"
+    } elseif ($codexText -notmatch 'http://127\.0\.0\.1:(8788|8791)/v1') {
+        # 8791 is the shim in front of both proxy instances, and is the better
+        # target: it fails over. 8788 is accepted for a config that predates
+        # the standby, but not anything else (a stray public base_url would
+        # silently send the user's traffic somewhere else).
+        Write-Log "codex provider '$codexProvider' points at neither the shim on :8791 nor the proxy on :8788"
         $codexOk = $false
     } elseif ($claudeProxyUp) {
         try {
@@ -256,7 +309,10 @@ if ($info -and $info.Length -gt 4MB) {
     Write-Log 'trimmed compat.log to its last 4000 lines'
 }
 
-$healthy = (($doctorExit -eq 0) -and $codexOk)
+# The standby is part of healthy: with one instance the stack still serves, but
+# it has no failover, and that is the state that turned a restart into a
+# 25-minute outage. Report it rather than hide it.
+$healthy = (($doctorExit -eq 0) -and $codexOk -and $standbyUp)
 $previous = 'unknown'
 if (Test-Path $state) { $previous = (Get-Content $state -Raw).Trim() }
 Set-Content -Path $state -Value ($(if ($healthy) { 'healthy' } else { 'unhealthy' })) -Encoding utf8
@@ -275,5 +331,5 @@ if (-not $healthy -and $previous -ne 'unhealthy') {
     Show-Toast ("Claude Code stack needs attention - " + $detail)
 }
 
-Write-Log ($(if ($healthy) { 'healthy' } else { 'unhealthy' }) + " (claude proxy=$claudeProxyUp shim=$claudeShimUp watchdog=$([bool]$watchdog) codex=$codexOk)")
+Write-Log ($(if ($healthy) { 'healthy' } else { 'unhealthy' }) + " (claude proxy=$claudeProxyUp standby=$standbyUp shim=$claudeShimUp watchdog=$([bool]$watchdog) codex=$codexOk)")
 exit $(if ($healthy) { 0 } else { 1 })

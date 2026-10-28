@@ -105,13 +105,12 @@ function Stop-StaleProxy {
     foreach ($p in $procs) {
         $cmd = $p.CommandLine
         if (-not $cmd) { continue }
-        if ($cmd -match 'litellm\.exe' -and $cmd -match '--config') {
+        # Only the instance on 8788. The standby on 8789 runs the same config,
+        # and a primary restart must not take it down: killing it removed the
+        # shim's fallback at exactly the moment it was needed. Matching on the
+        # port is what keeps the two independent.
+        if ($cmd -match 'litellm\.exe' -and $cmd -match '--config' -and $cmd -match '--port\s+8788') {
             $targets += $p.ProcessId
-            continue
-        }
-        if ($cmd -match 'spawn_main\(parent_pid=(\d+)') {
-            $parent = [int]$Matches[1]
-            if (-not $live.ContainsKey($parent)) { $targets += $p.ProcessId }
         }
     }
 
@@ -126,6 +125,19 @@ function Stop-StaleProxy {
             $held = Get-NetTCPConnection -LocalPort 8788 -State Listen -ErrorAction SilentlyContinue
             if (-not $held) { break }
         }
+    }
+
+    # A worker that outlived its parent keeps :8788 bound while no main process
+    # exists. Anything holding 8788 at this point is ours by definition, so take
+    # the port owner. Pattern-matching every orphaned worker instead would also
+    # catch the standby's worker and silently disable the failover.
+    $stillHeld = Get-NetTCPConnection -LocalPort 8788 -State Listen -ErrorAction SilentlyContinue
+    if ($stillHeld) {
+        foreach ($owner in ($stillHeld.OwningProcess | Select-Object -Unique)) {
+            Write-Host "Stopping process $owner, still holding :8788."
+            & taskkill /PID $owner /T /F 2>$null | Out-Null
+        }
+        Start-Sleep -Seconds 1
     }
 
     # Each start now writes its own log pair, so prune old ones instead of
@@ -225,17 +237,38 @@ $err = $log
 # watchdog does exactly that) the parent then blocks until the proxy exits,
 # i.e. forever. That is what made automatic restarts silently stop working.
 $launcher = Join-Path $nimDir 'run-proxy.bat'
-Start-Process -FilePath $launcher `
+$child = Start-Process -FilePath $launcher `
     -ArgumentList @("`"$log`"", "$workers") `
-    -WindowStyle Hidden | Out-Null
+    -WindowStyle Hidden -PassThru
 
-# Multiple workers load the catalog independently, so allow a generous window.
-for ($i = 0; $i -lt 120; $i++) {
+# Readiness wait, capped at 45s and abandoned as soon as the launched process
+# is gone. A healthy start binds in 15-25s. The old flat 120s window meant a
+# start that crashed at second 8 still held the caller (the watchdog, or the
+# `claude` launcher) for two minutes before saying anything, which reads as
+# "Claude and Codex are both hanging". If the child died, the log's tail holds
+# the real exception, so show it immediately instead of waiting out the clock.
+for ($i = 0; $i -lt 45; $i++) {
     Start-Sleep -Seconds 1
     if (Test-Proxy) { exit 0 }
+    if ($child -and $child.HasExited) {
+        Write-Host "Proxy process exited after $($i + 1)s without binding :8788."
+        break
+    }
 }
 
-Write-Host "Proxy did not become ready in time. Last lines of ${err}:"
+Write-Host "Proxy did not become ready. Last lines of ${err}:"
 Get-Content -LiteralPath $err -Tail 25 -ErrorAction SilentlyContinue | Write-Host
+
+# The failure that cost the most time was invisible: LiteLLM draws a Unicode
+# banner during startup with click.echo, and on a console whose encoding is
+# cp1252 that raises UnicodeEncodeError, aborts the lifespan, and exits before
+# the port is bound. Name it when it appears so the next reader does not spend
+# an hour on "connection refused".
+if (Select-String -LiteralPath $err -Pattern 'UnicodeEncodeError' -Quiet -ErrorAction SilentlyContinue) {
+    Write-Host 'Cause: startup crashed on the Unicode banner (stdout is not UTF-8).'
+    Write-Host 'PYTHONUTF8/PYTHONIOENCODING are set in run-proxy.bat; if this recurs, run:'
+    Write-Host '  setx PYTHONUTF8 1 ; setx PYTHONIOENCODING utf-8'
+}
+
 Write-Error "Proxy did not become ready; the next 'claude' will report a connection error until it does."
 exit 1

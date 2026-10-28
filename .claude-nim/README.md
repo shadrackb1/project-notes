@@ -320,3 +320,36 @@ the proxy.
   off silently.
 * **The config is verified on every start,** not edited and hoped for. A bad
   edit is repaired at the next start instead of ending a turn with a 429.
+
+## Redundancy: two instances, one address
+
+The same `config.yaml` runs twice — primary on `:8788`, standby on `:8789` — and
+the shim on `:8791` sits in front of both. Clients keep one address, so nothing
+changes when an instance dies.
+
+* **The shim fails over.** `compat.py` tries whichever upstream is healthy and
+  puts a port that just refused a connection at the back for 15 seconds. A
+  restarting proxy costs a few milliseconds instead of a failed turn.
+* **The starters do not overlap.** `start-proxy.ps1` sweeps and restarts only
+  the `:8788` instance; `start-proxy2.ps1` owns `:8789`. An earlier version
+  killed every `litellm` it could see, so restarting the primary deleted the
+  fallback at exactly the moment it was needed.
+* **The watchdog watches both,** and writes `watchdog.heartbeat` on every pass.
+  `maintenance.ps1` treats a heartbeat older than four minutes as a wedged
+  supervisor and replaces it. That gap is what allowed a single stuck
+  PowerShell pipeline to keep the stack down for 25 minutes while maintenance
+  logged "watchdog owns the restart" every ten minutes.
+* **Both keys are already redundant** inside the config: every model appears
+  twice, once per `NVIDIA_API_KEY` and `NVIDIA_API_KEY_2`, so a dead or
+  rate-limited key is a router failover rather than an outage.
+
+Checking it by hand:
+
+    curl -s http://127.0.0.1:8788/health/liveliness   # primary
+    curl -s http://127.0.0.1:8789/health/liveliness   # standby
+    curl -s http://127.0.0.1:8791/health/liveliness   # shim the clients use
+    tail -n 20 watchdog.log
+
+Both instances answering `"I'm alive!"` is the healthy state. The standby being
+down is reported by maintenance as unhealthy on purpose: the stack still serves,
+but without a fallback.
