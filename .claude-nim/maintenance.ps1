@@ -309,6 +309,26 @@ if ($info -and $info.Length -gt 4MB) {
     Write-Log 'trimmed compat.log to its last 4000 lines'
 }
 
+# --- Disk guard ------------------------------------------------------------
+# 2026-10-28: the volume sat at 0.62 GB free because the Windows Delivery
+# Optimization cache had grown to 41 GB. Every write then failed somewhere else
+# — Chromium pages, npm installs, proxy logs — so the symptom looked like a
+# dozen unrelated bugs. This pass reports the state; reclaim-space.ps1 does the
+# clearing and needs elevation because the largest item lives in a service
+# profile. Nothing here deletes anything.
+$diskFreeGB = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+if ($diskFreeGB -lt 5) {
+    Write-Log ("low disk: {0:N2} GB free; run reclaim-space.ps1 elevated" -f $diskFreeGB)
+    $doCache = 'C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization'
+    if (Test-Path -LiteralPath $doCache) {
+        $doSize = (Get-ChildItem -LiteralPath $doCache -Recurse -File -ErrorAction SilentlyContinue |
+            Measure-Object Length -Sum).Sum
+        if ($doSize) {
+            Write-Log ("  Delivery Optimization cache is {0:N2} GB" -f ($doSize / 1GB))
+        }
+    }
+}
+
 # The standby is part of healthy: with one instance the stack still serves, but
 # it has no failover, and that is the state that turned a restart into a
 # 25-minute outage. Report it rather than hide it.
@@ -331,5 +351,5 @@ if (-not $healthy -and $previous -ne 'unhealthy') {
     Show-Toast ("Claude Code stack needs attention - " + $detail)
 }
 
-Write-Log ($(if ($healthy) { 'healthy' } else { 'unhealthy' }) + " (claude proxy=$claudeProxyUp standby=$standbyUp shim=$claudeShimUp watchdog=$([bool]$watchdog) codex=$codexOk)")
+Write-Log ($(if ($healthy) { 'healthy' } else { 'unhealthy' }) + " (claude proxy=$claudeProxyUp standby=$standbyUp shim=$claudeShimUp watchdog=$([bool]$watchdog) codex=$codexOk disk=${diskFreeGB}GB)")
 exit $(if ($healthy) { 0 } else { 1 })
